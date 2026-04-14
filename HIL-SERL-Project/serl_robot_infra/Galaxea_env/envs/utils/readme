@@ -1,0 +1,10 @@
+处理的是relative_env.py和wrappers.py文件夹的极其纯粹的数学计算，比如四元数转欧拉角 (rotations.py)、齐次变换矩阵的构建 (transformations.py)。
+
+
+当你把整个环境跑起来的时候，代码的包裹关系是这样的（像俄罗斯套娃）：
+（1）最内层 (dual_galaxea_env.py)：直接连着物理世界。它只关心动作发出去没，用 rotations.py 算一下手腕角度。
+
+（2）中间层 (relative_env.py)：套在最内层外面。大模型发来的指令会先经过这里，它疯狂调用 transformations.py，把大模型那种“往前走 2 厘米”的相对指令，乘以 6x6 矩阵，
+翻译成“世界坐标系下的绝对指令”，再交给最内层。
+
+（3）最外层 (wrappers.py)：套在中间层外面。就是我们刚刚聊的 DualSpacemouseIntervention，它负责拦截动作，判断是不是人类（VR）接管了。

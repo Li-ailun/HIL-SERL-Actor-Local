@@ -1,0 +1,25 @@
+# 1. 核心忽略：强化学习采集的数据文件
+*.pkl
+classifier_data/
+
+# 2. 核心忽略：相机录像生成的视频文件
+videos/
+*.mp4
+*.avi
+
+# 3. Python 缓存和编译文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 4. ROS 2 构建产物（如果在此目录下编译）
+build/
+install/
+log/
+
+# 5. 编辑器和系统缓存
+.vscode/
+.idea/
+.DS_Store
+*~

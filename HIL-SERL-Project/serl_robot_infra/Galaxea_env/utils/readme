@@ -1,0 +1,6 @@
+处理的是communication文件夹的 ROS 2 消息、Base64 图像解码、双臂轨迹打点。
+
+
+
+dual_galaxea_env.py通过Ros2Bridge进行ros实现末端和夹爪控制通讯
+Ros2Bridge通过message_convert.py，datatype.py，torch_utils.py三个文件实现底层协议

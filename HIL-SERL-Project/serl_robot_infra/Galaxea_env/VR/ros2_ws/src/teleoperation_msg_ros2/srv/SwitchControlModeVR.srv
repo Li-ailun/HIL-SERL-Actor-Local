@@ -1,0 +1,4 @@
+bool use_vr_mode
+---
+bool success
+string message

@@ -1,0 +1,14 @@
+（1）作用：
+pyspacemouse.py定义接口：这是一个底层的 USB HID 驱动。它的作用是直接去电脑的 USB 端口读取 SpaceMouse 发出的原始二进制电信号，然后翻译成 x, y, z, roll, pitch, yaw。
+spacemouse_expert.py新进程处理数据：因为 USB 读取会有延迟和阻塞，所以他们写了这个脚本，开了一个独立的后台多进程 (multiprocessing.Process)，专门负责高频读取鼠标数据，然后放在内存共享字典里供强化学习环境调用。
+spacemouse_test.py测试功能是否可以输出遥操数据
+
+（2）但是：我们不需要写这复杂的接口文件（不需要手搓硬件底层驱动和高频轮询引擎）
+我们的vr自带星海图打包好的通讯包，直接读取指令数据即可。
+
+
+VR模块实现后，vr_test.py测试脚本测试vr功能。
+
+
+（3）ros2_ws作用：
+里面有 teleoperation_msg_ros2 包，它是翻译 VR 数据的字典。记得提前 colcon build 编译好。

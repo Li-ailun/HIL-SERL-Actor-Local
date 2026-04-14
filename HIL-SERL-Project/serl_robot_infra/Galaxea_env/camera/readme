@@ -1,0 +1,93 @@
+# 负责python的相机通信
+# dual_galaxea_env.py从这里实现相机python通讯
+
+
+
+
+
+
+
+
+# # ==========================================
+#         # 3. 启动硬件直连多相机队列 (踢开 ROS 2)
+#         # ==========================================
+#         print("🚀 正在启动 USB 直连相机阵列...")
+        
+#         # 左腕相机
+#         left_wrist_cap = RSCapture(name="left_wrist_rgb", serial_number="230322270950", dim=(640, 480), fps=15)
+#         # 右腕相机
+#         right_wrist_cap = RSCapture(name="right_wrist_rgb", serial_number="230322271216", dim=(640, 480), fps=15)
+        
+#         # # 头部 ZED 相机 (设备号: 2)
+#         # zed_cv2 = cv2.VideoCapture(2)
+#         # zed_cv2.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+#         # zed_cv2.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+#         # zed_cv2.set(cv2.CAP_PROP_FPS, 15)
+
+#         # 初始化 ZED (设备号: 2)
+#         #目前仍不好用
+#         # 1. 强制明确使用 V4L2 后端
+#         zed_cv2 = cv2.VideoCapture(2, cv2.CAP_V4L2)
+        
+#         # 2. 🛡️ 杀手锏：强制要求相机硬件端使用 MJPG 格式压缩图像后再传给 USB！
+#         # 这会极大极大降低 USB 带宽压力，杜绝绿屏！
+#         zed_cv2.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        
+#         # 3. 🛡️ 将分辨率降到 ZED 支持的最底档 (WVGA)，由于是双目，宽度是 672x2 = 1344
+#         # 反正最后都要被 resize 到 128x128，底层要那么高清毫无意义
+#         zed_cv2.set(cv2.CAP_PROP_FRAME_WIDTH, 1344)
+#         zed_cv2.set(cv2.CAP_PROP_FRAME_HEIGHT, 376)
+#         zed_cv2.set(cv2.CAP_PROP_FPS, 15)
+
+        
+#         if not zed_cv2.isOpened():
+#             print("⚠️ 警告: 无法通过 /dev/video2 打开 ZED 相机，请检查权限或设备占用！")
+            
+#         head_cap = VideoCapture(zed_cv2, name="head_rgb")
+
+#         # 将它们打包进软同步管理器
+#         self.multi_cap = MultiVideoCapture({
+#             "head_rgb": head_cap,
+#             "left_wrist_rgb": left_wrist_cap,
+#             "right_wrist_rgb": right_wrist_cap
+#         })
+#         print("✅ 相机阵列启动完毕！")
+
+############上述部分的作用：
+
+
+
+# 在这个全自动 + 人类接管的闭环系统里，这段代码扮演的是**“绝对的视觉源头（单点真理）”。从头到尾，这段代码输出的 head_rgb 画面，会像血液一样流经系统的五个关键器官**：
+
+# 🩸 第一站：录制初始字典（Demo 收集期）
+# 发生什么：你拿着 VR 手柄做示范。
+
+# ZED 的作用：这段代码以 15Hz 的频率疯狂吐出画面。上层代码把这时的 head_rgb（以及手腕图）和你的 VR 动作打包成一对存起来。
+
+# 意义：这是给 AI 的第一本教材。
+
+# 🩸 第二站：铸造“无情裁判”（训练奖励分类器）
+# 发生什么：提取刚才录好的 Demo 数据，单独把 ZED 相机的画面拿出来。
+
+# ZED 的作用：专门把 ZED 拍到的**“任务成功瞬间的最后一帧画面”**（比如内存条刚好插进去的那一刻）挑出来，告诉一个独立的 ResNet 网络：“记住，长这样的画面，就是 1 分，其他的都是 0 分！”
+
+# 意义：这就是为什么你代码里有个注释说“视觉奖励分类器观测到成功画面则给奖励 1”。这个分类器主要就是只看 ZED 头部相机的画面来做裁决的（因为头部视野广，能看清全局）。
+
+# 🩸 第三站：AI 瞎子摸象（全自动强化学习期）
+# 发生什么：VR 手柄放下，机器人靠大模型自己动。
+
+# ZED 的作用：每个 step（1/15秒），这段代码吐出一张图，瞬间塞进强化学习的 Actor 网络里。网络经过计算，吐出 14 维动作。
+
+# 意义：此时，这段代码就是机器人的**“方向盘”**，引导它走向目标。
+
+# 🩸 第四站：老司机抢方向盘（VR 接管纠错期 —— HIL 的灵魂！）
+# 发生什么：AI 走偏了，要撞桌子了！你瞬间按下 VR 扳机，强行接管。
+
+# ZED 的作用：这段代码依然在淡定地输出画面！但此时，上层逻辑（wrappers.py）把 AI 的动作扔进了垃圾桶，换成了你 VR 摇出来的动作。
+
+# 意义：这一刻的 ZED 画面 + 你的救场动作，会被框架打上特殊的 intervene 标签存下来。AI 之后学到这段数据时会恍然大悟：“哦！原来当我把画面搞成这么危险的边缘状态时，人类是这样把我拽回来的！”
+
+#  第五站：赛后结算（Reward 计算）
+# 发生什么：AI 走完了 100 步（回合结束）。
+
+# ZED 的作用：把最后一步这段代码拍下来的 head_rgb 扔给“第二站”训练好的无情裁判。裁判一看：“嗯，画面符合，给 1 分！” 或者 “不行，没插进去，给 0 分！”

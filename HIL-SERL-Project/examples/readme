@@ -1,0 +1,42 @@
+（1）此处存放录制数据和训练的脚本
+（2）训练脚本导入serl_launcher的接口，接入serl_launcher的神经网络开始训练
+
+
+
+数据采集类：给 AI 提供学习素材record_demos.py (录制专家演示)
+核心作用：收集高质量的“专家轨迹”。
+工作机制：它会运行一个循环，直到收集到指定数量（successes_needed）的成功尝试为止。
+它通过 env.step 获取数据，并监听 info 字典中的 intervene_action（通常来自你的 VR 手柄或 SpaceMouse）。
+输出结果：将包含观测、动作、奖励等信息的轨迹保存到 ./demo_data/ 下的 .pkl 文件中。
+
+
+record_success_fail.py (录制成功/失败样本)
+核心作用：为训练“视觉奖励分类器”提供图片素材。
+工作机制：机器人随机运动或由人类操作，人类通过按下 空格键 来标记当前的画面是“成功状态”。
+输出结果：在 ./classifier_data/ 下生成成功和失败的图片/状态对，这是 AI 学会“分辨任务是否完成”的基础。
+
+
+2. 视觉大脑训练：让 AI 学会分辨对错
+train_reward_classifier.py (训练奖励分类器)
+核心作用：训练一个二分类神经网络（通常是 ResNet），用来代替传统的硬编码奖励函数。
+工作机制：加载 record_success_fail.py 采集的数据，使用二元交叉熵损失函数（Binary Cross Entropy）进行训练。
+输出结果：保存模型权重到 classifier_ckpt/。训练好后，AI 就能通过摄像头画面自动输出一个 0 到 1 之间的数值，代表任务成功的概率。
+
+3. 模仿学习：让 AI 快速“入门”train_bc.py (行为克隆训练)
+核心作用：通过监督学习，让 AI 像素级模仿人类录制的专家数据。
+工作机制：加载 demo_data 中的数据，训练策略网络（Policy）直接建立“观测 -> 动作”的映射。
+输出结果：生成一个初始模型。虽然它不具备解决复杂问题的能力，但它能让机器人不再“乱挥”，而是初步具备人类的操作风格。
+
+4. 进阶训练：让 AI 在交互中进化
+
+方法一：train_hgdagger.py (人类干预式模仿学习)
+核心作用：HG-DAgger (Human-Gated DAgger)。通过人类的实时纠错来提升 AI。
+工作机制：AI 尝试执行任务，人类在旁边监督。一旦 AI 出错，人类通过手柄“抢夺”控制权（干预）。
+系统会将这些“纠错数据”实时加入训练集，让 AI 专门学习如何从错误状态中恢复。
+
+方法二：train_rlpd.py (人类干预式强化学习 - 最终大招)
+核心作用：RLPD (Reinforcement Learning from Prior Data)。这是 SERL 的核心算法。
+工作机制：它采用 50/50 采样策略：
+每次训练更新时，一半数据来自专家演示（Demo Buffer），另一半来自机器人自己在环境中摸索的数据（Replay Buffer）。
+它通常使用 SAC（Soft Actor-Critic）算法。
+数学逻辑：利用计算奖励概率 $p$ 的 Sigmoid 函数：

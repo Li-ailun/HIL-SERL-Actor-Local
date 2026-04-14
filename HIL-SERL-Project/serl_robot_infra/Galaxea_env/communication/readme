@@ -1,0 +1,2 @@
+负责ros的末端和夹爪控制通信
+dual_galaxea_env.py从这里实现ros控制通讯

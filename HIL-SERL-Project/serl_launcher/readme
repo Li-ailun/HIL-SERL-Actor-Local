@@ -1,0 +1,60 @@
+一句话回答：是的，99% 的情况下你完全不需要碰 serl_launcher！即使你的动作从单臂（7维）变成了双臂（14维），它也能自动适应。
+
+这就是现代强化学习框架（基于 Gymnasium 接口）最优雅的地方——“动态拓扑”。
+
+我来给你揭秘一下为什么它能这么聪明，以及在什么极端情况下你才需要去改它：
+
+🧠 为什么输入输出变了也不用改？
+你之前在 dual_galaxea_env.py 里写过这样两行极其重要的代码：
+
+Python
+
+self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(14,), dtype=np.float32)
+self.observation_space = gym.spaces.Dict({ ... })
+这其实就是你向 serl_launcher 提交的**“神经网络定制订单”**。
+
+当你在 examples/ 里运行训练脚本时，serl_launcher 里的构建代码会经历以下过程：
+
+看订单：“哦，Galaxea 传过来的动作空间 shape 是 14。”
+
+自动造脑：它会在 JAX/Flax 底层，自动把 Actor 网络（策略网络）的最后一层输出神经元数量设置成 14。
+
+看眼睛：“哦，他传了三个图像 key（head_rgb, left_wrist, right_wrist）。”
+
+自动接线：它会自动实例化三个 ResNet 视觉编码器，把图片特征提取出来，然后和你的 14 维本体状态拼在一起，送进全连接层。
+
+所以，无论你是单臂、双臂，还是多长了两条腿，只要你的 env.action_space 和 env.observation_space 定义是合法的，算法内核就会像水一样适应你的容器形状。
+
+⚠️ 哪 1% 的情况你需要去改 serl_launcher？
+除非你想对强化学习的数学本质或核心网络架构动刀子，否则别碰它。例如：
+
+换脑手术：觉得 ResNet 提取图像特征太老了，你想手搓一个 Vision Transformer (ViT) 或者加入注意力机制（Attention）。（这需要改 vision/ 里的模型结构）
+
+改数学公式：你想修改 SAC 算法的损失函数（Loss Function），或者加一个你发明的正则化项。
+
+改记忆体：你想修改 Replay Buffer 的采样逻辑，比如加入优先级经验回放（PER）。
+
+只要你现在的目标是**“把任务跑通、训出能干活的模型”**，把 serl_launcher 当成一个完美的黑盒就行了。
+
+🧩 你的动作和状态是怎么传给它的？
+这就是我们上一个回合提到的**“第一站：配置中心” (examples/ram_insertion/config.py 或你自己的 config)** 的作用了！
+
+虽然你不用改 serl_launcher 的源码，但你必须在 config.py 里告诉它，你的观测字典里，哪些是给视觉网络看的，哪些是给状态网络看的。
+
+比如原版 config.py 里有这样的设定：
+
+Python
+
+class TrainConfig:
+    # 告诉算法去 env 的字典里找这几个名字的图片
+    image_keys = ["wrist_1", "wrist_2"] 
+    # 告诉分类器去拿哪张图打分
+    classifier_keys = ["wrist_1", "wrist_2"]
+    ...
+对于你的 Galaxea R1 PRO，你只需要在你的 config.py 里把它们改成：
+
+Python
+
+class TrainConfig:
+    image_keys = ["head_rgb", "left_wrist_rgb", "right_wrist_rgb"] 
+    classifier_keys = ["head_rgb"] # 比如你只用头图来判断任务是否成功
