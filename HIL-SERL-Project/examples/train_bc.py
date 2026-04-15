@@ -48,7 +48,7 @@ from gymnasium import spaces
 from gymnasium.wrappers.record_episode_statistics import RecordEpisodeStatistics
 
 # ==============================================================
-# 🔥 核心路径配置
+# 核心路径配置
 # ==============================================================
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SERL_LAUNCHER_ROOT = os.path.join(PROJECT_ROOT, "serl_launcher")
@@ -65,7 +65,6 @@ from serl_launcher.agents.continuous.bc import BCAgent
 from serl_launcher.utils.launcher import make_bc_agent, make_wandb_logger
 from serl_launcher.data.data_store import MemoryEfficientReplayBufferDataStore
 
-
 from examples.galaxea_task.usb_pick_insertion.config import env_config
 
 FLAGS = flags.FLAGS
@@ -75,11 +74,13 @@ flags.DEFINE_integer("seed", 42, "Random seed.")
 flags.DEFINE_string("ip", "localhost", "IP address of the learner.")
 flags.DEFINE_string("bc_checkpoint_path", "./bc_checkpoints", "Path to save checkpoints.")
 flags.DEFINE_integer("eval_n_trajs", 0, "Number of trajectories to evaluate.")
-flags.DEFINE_integer("train_steps", 20_000, "Number of pretraining steps.")
-flags.DEFINE_bool("save_video", False, "Save video of the evaluation.")
-flags.DEFINE_boolean("debug", False, "Debug mode.")  # debug mode will disable wandb logging
+flags.DEFINE_integer("train_steps", 20_000, "Number of BC pretraining steps.")
+flags.DEFINE_bool("save_video", False, "Save video during evaluation.")
+flags.DEFINE_boolean("debug", False, "Debug mode. Will disable wandb logging.")
 
+# ==============================================================
 # JAX 多设备配置
+# ==============================================================
 devices = jax.local_devices()
 num_devices = len(devices)
 sharding = jax.sharding.PositionalSharding(devices)
@@ -94,7 +95,7 @@ def print_yellow(x):
 
 
 # ==============================================================
-# 训练阶段：从 demo_data 推断 space / sample，彻底绕开真实环境
+# 训练阶段：从 demo_data 推断 obs/action 结构，绕开真实环境
 # ==============================================================
 
 def infer_space_from_value(x):
@@ -116,7 +117,6 @@ def infer_space_from_value(x):
             dtype=arr.dtype,
         )
     else:
-        # 注意：这里只是为了描述 shape/dtype，不用于 sample()
         return spaces.Box(low=-np.inf, high=np.inf, shape=arr.shape, dtype=arr.dtype)
 
 
@@ -128,7 +128,7 @@ def get_demo_paths():
 
 
 def get_first_valid_transition(demo_paths):
-    """找第一条有效 transition，用来推断 obs/action 结构。"""
+    """找第一条非零动作 transition，用来初始化 BC agent。"""
     for path in demo_paths:
         with open(path, "rb") as f:
             transitions = pkl.load(f)
@@ -137,16 +137,16 @@ def get_first_valid_transition(demo_paths):
             if np.linalg.norm(np.asarray(transition["actions"])) > 0.0:
                 return transition
 
-    raise ValueError("❌ demo_data 中没有找到有效的非零动作 transition，无法初始化 BC agent。")
+    raise ValueError("❌ demo_data 中没有找到有效的非零动作 transition。")
 
 
 def build_spaces_and_samples_from_demos(demo_paths):
     """
-    从 demo_data 中同时推断：
-    1. observation_space
-    2. action_space
-    3. sample_obs
-    4. sample_action
+    从 demo_data 推断：
+    1) observation_space
+    2) action_space
+    3) sample_obs
+    4) sample_action
     """
     sample_transition = get_first_valid_transition(demo_paths)
 
@@ -159,36 +159,42 @@ def build_spaces_and_samples_from_demos(demo_paths):
     return observation_space, action_space, sample_obs, sample_action
 
 
-##############################################################################
+# ==============================================================
+# 评估：Actor Loop
+# ==============================================================
 
 def eval(env, bc_agent: BCAgent, sampling_rng):
     """
-    模型验证推理循环 (Actor Loop)
-    工作原理：加载训好的 BC 权重，根据当前环境状态，让神经网络推断出动作，并操控机械臂。
+    加载训练好的 BC 权重，在真实环境中做推理评估。
     """
     success_counter = 0
     time_list = []
+
     for episode in range(FLAGS.eval_n_trajs):
         obs, _ = env.reset()
         done = False
         start_time = time.time()
 
         while not done:
-            rng, key = jax.random.split(sampling_rng)
+            sampling_rng, key = jax.random.split(sampling_rng)
             actions = bc_agent.sample_actions(observations=obs, seed=key)
             actions = np.asarray(jax.device_get(actions))
 
-            next_obs, reward, done, truncated, info = env.step(actions)
+            next_obs, reward, done, _, info = env.step(actions)
             obs = next_obs
 
             if done:
-                if info.get("succeed", False):
+                # 优先看 info["succeed"]，如果没有就退化为 reward>0
+                success = bool(info.get("succeed", reward > 0))
+
+                if success:
                     dt = time.time() - start_time
                     time_list.append(dt)
                     print_green(f"✅ 第 {episode + 1} 回合成功！耗时: {dt:.2f}s")
                     success_counter += 1
                 else:
                     print_yellow(f"❌ 第 {episode + 1} 回合失败。")
+
                 print(f"📊 当前成功率: {success_counter}/{episode + 1}")
 
     print_green(f"🏆 最终评估成功率: {success_counter / FLAGS.eval_n_trajs:.2%}")
@@ -196,12 +202,17 @@ def eval(env, bc_agent: BCAgent, sampling_rng):
         print_green(f"⏱️ 成功任务平均耗时: {np.mean(time_list):.2f}s")
 
 
-##############################################################################
+# ==============================================================
+# 训练：Learner Loop
+# ==============================================================
 
 def train(bc_agent: BCAgent, bc_replay_buffer, config, wandb_logger=None):
     """
-    行为克隆训练循环 (Learner Loop)
-    工作原理：从录制好的 .pkl 数据中不断抽取 batch，计算 Loss 并更新神经网络权重。
+    官方 BC 核心训练逻辑：
+    - 从 replay buffer 取 batch
+    - 执行 bc_agent.update(batch)
+    - 定期写日志
+    - 最后 100 步每 10 步保存 checkpoint
     """
     bc_replay_iterator = bc_replay_buffer.get_iterator(
         sample_args={
@@ -223,8 +234,7 @@ def train(bc_agent: BCAgent, bc_replay_buffer, config, wandb_logger=None):
             wandb_logger.log({"bc": bc_update_info}, step=step)
 
         if step > FLAGS.train_steps - 100 and step % 10 == 0:
-            if not os.path.exists(FLAGS.bc_checkpoint_path):
-                os.makedirs(FLAGS.bc_checkpoint_path)
+            os.makedirs(FLAGS.bc_checkpoint_path, exist_ok=True)
             checkpoints.save_checkpoint(
                 os.path.abspath(FLAGS.bc_checkpoint_path),
                 bc_agent.state,
@@ -235,16 +245,18 @@ def train(bc_agent: BCAgent, bc_replay_buffer, config, wandb_logger=None):
     print_green("✅ BC 预训练完成并已保存 Checkpoint！")
 
 
-##############################################################################
+# ==============================================================
+# 主函数
+# ==============================================================
 
 def main(_):
     config = env_config
-    assert config.batch_size % num_devices == 0, "Batch size 必须能被 GPU 数量整除！"
+    assert config.batch_size % num_devices == 0, "Batch size 必须能被当前 JAX 设备数量整除。"
 
     eval_mode = FLAGS.eval_n_trajs > 0
 
     # ==========================================================
-    # 🔄 训练模式：不创建真实环境
+    # 训练模式：不创建真实环境
     # ==========================================================
     if not eval_mode:
         demo_paths = get_demo_paths()
@@ -259,11 +271,12 @@ def main(_):
         )
 
         bc_agent = jax.device_put(
-            jax.tree_map(jnp.array, bc_agent), sharding.replicate()
+            jax.tree_util.tree_map(jnp.array, bc_agent),
+            sharding.replicate(),
         )
 
         if os.path.isdir(os.path.join(FLAGS.bc_checkpoint_path, f"checkpoint_{FLAGS.train_steps}")):
-            print_yellow("⚠️ 警告：目标 checkpoint 似乎已存在，可能会被覆盖！")
+            print_yellow("⚠️ 警告：目标 checkpoint 似乎已存在，可能会被覆盖。")
 
         bc_replay_buffer = MemoryEfficientReplayBufferDataStore(
             observation_space,
@@ -282,12 +295,12 @@ def main(_):
             with open(path, "rb") as f:
                 transitions = pkl.load(f)
                 for transition in transitions:
-                    # 自动剔除发呆帧
+                    # 官方逻辑保留：过滤零动作帧
                     if np.linalg.norm(np.asarray(transition["actions"])) > 0.0:
                         bc_replay_buffer.insert(transition)
 
-        print_green(f" BC 专家数据池加载完毕，有效帧数: {len(bc_replay_buffer)}")
-        print_green(" 开始执行 Learner Loop (网络训练)...")
+        print_green(f"📦 BC 专家数据池加载完毕，有效帧数: {len(bc_replay_buffer)}")
+        print_green("🚀 开始执行 Learner Loop (网络训练)...")
 
         train(
             bc_agent=bc_agent,
@@ -297,15 +310,14 @@ def main(_):
         )
 
     # ==========================================================
-    # 🎮 评估模式：才创建真实环境
+    # 评估模式：才创建真实环境
     # ==========================================================
     else:
         env = env_config.get_environment(
             fake_env=False,
-            #save_video=False,
-            save_video=FLAGS.save_video,  #默认不保存视频，指令输入控制此次执行脚本保存视频
-            classifier=False,
-            use_vr=False,
+            save_video=FLAGS.save_video,   #默认不保存视频，指令输入控制此次执行脚本保存视频
+            classifier=True,   # 评估时按官方思路保留分类器/成功判定能力
+            use_vr=False,      # BC 实机评估不依赖 VR
         )
         env = RecordEpisodeStatistics(env)
 
@@ -318,7 +330,8 @@ def main(_):
         )
 
         bc_agent = jax.device_put(
-            jax.tree_map(jnp.array, bc_agent), sharding.replicate()
+            jax.tree_util.tree_map(jnp.array, bc_agent),
+            sharding.replicate(),
         )
 
         rng = jax.random.PRNGKey(FLAGS.seed)
@@ -331,7 +344,7 @@ def main(_):
         )
         bc_agent = bc_agent.replace(state=bc_ckpt)
 
-        print_green("🚀 权重加载成功，进入 Actor Loop (实车验证)...")
+        print_green("🚀 权重加载成功，进入 Actor Loop (实机验证)...")
         eval(
             env=env,
             bc_agent=bc_agent,
@@ -341,4 +354,3 @@ def main(_):
 
 if __name__ == "__main__":
     app.run(main)
-
