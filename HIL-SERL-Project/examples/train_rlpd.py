@@ -122,12 +122,46 @@
 
 ####################################################
 
+#本地（一直开着）：ssh -p 2122 -L 5588:localhost:5588 lixiang@service.qich.top
+#用处：转接learner（服务器）端口5588,
+#另开本地终端输入指令：
+# python train_rlpd.py \
+#   --exp_name=galaxea_usb_insertion \
+#   --actor=True \
+#   --ip=localhost \
+#   --demo_path=./demo_data \
+#   --checkpoint_path=./rlpd_checkpoints \
+#   --debug=True
+
+
+
 import os
 import sys
 import glob
 import time
 import copy
 import pickle as pkl
+
+
+def _should_force_cpu_for_actor():
+    """在 absl flags 解析前，先从原始 argv 判断是不是 actor 模式。"""
+    argv = [arg.lower() for arg in sys.argv[1:]]
+
+    for arg in argv:
+        if arg == "--actor":
+            return True
+        if arg.startswith("--actor="):
+            value = arg.split("=", 1)[1]
+            if value in ("true", "1", "yes", "y", "t"):
+                return True
+    return False
+
+
+# 关键：必须放在 import jax 之前
+if _should_force_cpu_for_actor():
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import jax
 import jax.numpy as jnp
@@ -338,7 +372,7 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng, config):
         FLAGS.ip,
         make_trainer_config(),
         data_stores=datastore_dict,
-        wait_for_server=True,
+        wait_for_server=False,
         timeout_ms=3000,
     )
 
@@ -575,9 +609,11 @@ def main(_):
     rng = jax.random.PRNGKey(FLAGS.seed)
     rng, sampling_rng = jax.random.split(rng)
 
+    print_green(f"JAX backend: {jax.default_backend()}, devices: {jax.devices()}")
+
     # ---------------------------------------------------------
-    # Learner：不创建真实环境，从 demo 推断空间和样本
-    # Actor：创建真实环境
+    # Learner / Actor 都先从 demo 推断空间和样本
+    # Actor 的真实环境延后到 agent 初始化之后再创建
     # ---------------------------------------------------------
     if FLAGS.learner:
         assert FLAGS.demo_path is not None, "❌ Learner 必须通过 --demo_path 传入初始 demo 数据路径"
@@ -585,25 +621,13 @@ def main(_):
         observation_space, action_space, sample_obs, sample_action = build_spaces_and_samples_from_demos(demo_paths)
         env = None
     else:
-        # 训练 Actor：需要 VR
-        # 评估 Actor：不要 VR
-        use_vr = False if FLAGS.eval_checkpoint_step > 0 else True
-
-        env = env_config.get_environment(
-            fake_env=False,
-            save_video=FLAGS.save_video if FLAGS.eval_checkpoint_step > 0 else False,
-            classifier=True,
-            use_vr=use_vr,
-        )
-        env = RecordEpisodeStatistics(env)
-
-        observation_space = env.observation_space
-        action_space = env.action_space
-        sample_obs = observation_space.sample()
-        sample_action = action_space.sample()
+        assert FLAGS.demo_path is not None, "❌ Actor 现在也需要通过 --demo_path 提供一份 demo，用于初始化网络结构"
+        demo_paths = resolve_demo_paths(FLAGS.demo_path)
+        observation_space, action_space, sample_obs, sample_action = build_spaces_and_samples_from_demos(demo_paths)
+        env = None
 
     rng, sampling_rng = jax.random.split(rng)
-
+    
     # ---------------------------------------------------------
     # 按官方结构动态选择 SAC 变体
     # ---------------------------------------------------------
@@ -643,11 +667,15 @@ def main(_):
     else:
         raise NotImplementedError(f"Unknown setup mode: {config.setup_mode}")
 
-    agent = jax.device_put(
-        jax.tree_util.tree_map(jnp.array, agent),
-        sharding.replicate(),
-    )
-
+    if FLAGS.learner:
+        agent = jax.device_put(
+            jax.tree_util.tree_map(jnp.array, agent),
+            sharding.replicate(),
+        )
+    else:
+        # Actor 只做单机推理，不做多卡复制
+        agent = jax.tree_util.tree_map(jnp.array, agent)
+        
     if FLAGS.checkpoint_path is not None and os.path.exists(FLAGS.checkpoint_path) and glob.glob(os.path.join(FLAGS.checkpoint_path, "checkpoint_*")):
         input("Checkpoint path already exists. Press Enter to resume training.")
         ckpt = checkpoints.restore_checkpoint(
@@ -721,6 +749,7 @@ def main(_):
             agent,
             replay_buffer,
             demo_buffer=demo_buffer,
+
             wandb_logger=wandb_logger,
             config=config,
         )
@@ -729,7 +758,22 @@ def main(_):
     # Actor
     # ---------------------------------------------------------
     else:
-        sampling_rng = jax.device_put(sampling_rng, sharding.replicate())
+        # Actor 只用单设备 RNG
+        sampling_rng = jax.device_put(sampling_rng)
+
+        # 训练 Actor：需要 VR
+        # 评估 Actor：不要 VR
+        use_vr = False if FLAGS.eval_checkpoint_step > 0 else True
+
+        # 关键：先完成 agent 初始化，再启动真实环境
+        env = env_config.get_environment(
+            fake_env=False,
+            save_video=FLAGS.save_video if FLAGS.eval_checkpoint_step > 0 else False,
+            classifier=False,   # 先只解决 classifier=False 这条
+            use_vr=use_vr,
+        )
+        env = RecordEpisodeStatistics(env)
+
         data_store = QueuedDataStore(50000)
         intvn_data_store = QueuedDataStore(50000)
 
@@ -742,7 +786,6 @@ def main(_):
             sampling_rng,
             config,
         )
-
 
 if __name__ == "__main__":
     app.run(main)

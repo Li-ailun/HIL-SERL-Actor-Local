@@ -102,8 +102,8 @@ class GalaxeaUSBEnvConfig:
     # ==============================
     # 1. 任务物理参数
     # ==============================
-    RESET_L = np.array([0.2, -0.15, -0.3, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
-    RESET_R = np.array([0.2, -0.25, -0.3, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    RESET_L = np.array([0.2, 0.25, -0.3, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    RESET_R = np.array([0.2, 0.25, -0.3, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
 
     RANDOM_RESET = True
     RANDOM_XY_RANGE = 0.01
@@ -145,7 +145,7 @@ class GalaxeaUSBEnvConfig:
     }
 
     HEAD_CAMERA = {
-        "device_index": 0,  #v4l2-ctl --list-devices查询
+        "device_index": 14,  #v4l2-ctl --list-devices查询
         "api": cv2.CAP_V4L2,  # # 显式指定使用 Linux V4L2 后端打开 /dev/videoX
         "fourcc": "MJPG",
         "frame_width": 1344,

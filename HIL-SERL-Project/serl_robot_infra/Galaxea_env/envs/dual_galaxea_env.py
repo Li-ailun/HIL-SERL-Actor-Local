@@ -489,27 +489,30 @@ class GalaxeaDualArmEnv(gym.Env):
 
     def _send_ros_poses(self, p_l, p_r, g_l, g_r):
         """构建标准 ROS2 PoseStamped / JointState 并发布。"""
+        p_l = np.asarray(p_l, dtype=np.float64).reshape(-1)
+        p_r = np.asarray(p_r, dtype=np.float64).reshape(-1)
+
         msg_left = PoseStamped()
         msg_left.header.stamp = self.bridge.node.get_clock().now().to_msg()
         msg_left.header.frame_id = "base_link"
-        msg_left.pose.position.x = p_l[0]
-        msg_left.pose.position.y = p_l[1]
-        msg_left.pose.position.z = p_l[2]
-        msg_left.pose.orientation.x = p_l[3]
-        msg_left.pose.orientation.y = p_l[4]
-        msg_left.pose.orientation.z = p_l[5]
-        msg_left.pose.orientation.w = p_l[6]
+        msg_left.pose.position.x = float(p_l[0])
+        msg_left.pose.position.y = float(p_l[1])
+        msg_left.pose.position.z = float(p_l[2])
+        msg_left.pose.orientation.x = float(p_l[3])
+        msg_left.pose.orientation.y = float(p_l[4])
+        msg_left.pose.orientation.z = float(p_l[5])
+        msg_left.pose.orientation.w = float(p_l[6])
 
         msg_right = PoseStamped()
         msg_right.header.stamp = self.bridge.node.get_clock().now().to_msg()
         msg_right.header.frame_id = "base_link"
-        msg_right.pose.position.x = p_r[0]
-        msg_right.pose.position.y = p_r[1]
-        msg_right.pose.position.z = p_r[2]
-        msg_right.pose.orientation.x = p_r[3]
-        msg_right.pose.orientation.y = p_r[4]
-        msg_right.pose.orientation.z = p_r[5]
-        msg_right.pose.orientation.w = p_r[6]
+        msg_right.pose.position.x = float(p_r[0])
+        msg_right.pose.position.y = float(p_r[1])
+        msg_right.pose.position.z = float(p_r[2])
+        msg_right.pose.orientation.x = float(p_r[3])
+        msg_right.pose.orientation.y = float(p_r[4])
+        msg_right.pose.orientation.z = float(p_r[5])
+        msg_right.pose.orientation.w = float(p_r[6])
 
         msg_gripper_left = JointState()
         msg_gripper_left.header.stamp = self.bridge.node.get_clock().now().to_msg()
@@ -528,7 +531,6 @@ class GalaxeaDualArmEnv(gym.Env):
             self.bridge.publishers[self.bridge.topics_config.action["right_gripper"]].publish(msg_gripper_right)
         except KeyError as e:
             print(f"⚠️ 发布动作时出现异常: {e}")
-
     # ==========================================================
     # 观测抓取
     # ==========================================================
