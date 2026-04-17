@@ -1,25 +1,48 @@
-# 1. 核心忽略：强化学习采集的数据文件
-*.pkl
-classifier_data/
-
-# 2. 核心忽略：相机录像生成的视频文件
-videos/
-*.mp4
-*.avi
-
-# 3. Python 缓存和编译文件
+# Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
+*.pyc
+*.pyo
+*.pyd
 
-# 4. ROS 2 构建产物（如果在此目录下编译）
-build/
-install/
-log/
-
-# 5. 编辑器和系统缓存
+# VS Code / system
 .vscode/
-.idea/
 .DS_Store
-*~
+
+# Logs
+*.log
+wandb/
+runs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data files
+*.pkl
+*.npz
+*.npy
+
+# Checkpoints
+*.ckpt
+checkpoint_*/
+**/checkpoint_*/
+*.orbax-checkpoint-tmp
+*.orbax-checkpoint-tmp/
+**/*.orbax-checkpoint-tmp
+**/*.orbax-checkpoint-tmp/
+
+# Training outputs / buffers
+buffer/
+demo_buffer/
+classifier_ckpt/*
+!classifier_ckpt/.gitkeep
+
+# Keep folders but ignore contents
+examples/demo_data/*
+!examples/demo_data/.gitkeep
+
+examples/classifier_data/*
+!examples/classifier_data/.gitkeep
+
+examples/classifier_ckpt/*
+!examples/classifier_ckpt/.gitkeep
+

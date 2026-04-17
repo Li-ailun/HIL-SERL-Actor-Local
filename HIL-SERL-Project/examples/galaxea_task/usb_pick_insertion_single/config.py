@@ -302,6 +302,7 @@ class GalaxeaUSBTrainConfig(DefaultTrainingConfig):
                     key=jax.random.PRNGKey(0),
                     sample=env.observation_space.sample(),
                     image_keys=self.classifier_keys,
+                    ##若需要奖励，在如下目录下搜索奖励分类器ckpt
                     checkpoint_path=os.path.abspath("classifier_ckpt/"),
                 )
 

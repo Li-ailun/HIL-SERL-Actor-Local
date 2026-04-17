@@ -19,46 +19,119 @@ api key(hilserlKey):wandb_v1_8Uf8krEtedBNwL62O6QBNeaBoRK_miAJZd1wqF00VrFsvbfxKCc
 
 
 
-我这个脚本，后续实机评估的时候需要usb识别相机，还要接收/hdas/feedback_gripper_left \ 
-/hdas/feedback_gripper_right \ 
-/motion_control/pose_ee_arm_left \ 
-/motion_control/pose_ee_arm_right \ 的ros反馈的状态信息，还要输出ros2 topic pub /motion_target/target_pose_arm_left geometry_msgs/msg/PoseStamped \
-"{
-  header: {
-    stamp: {sec: 0, nanosec: 0},
-    frame_id: 'base_link'    
-  },
-  pose: {
-    position: {
-      x: 0.2,  
-      y: 0.25,  
-      z: -0.3   
-    },
-    orientation: {
-      x: 0.0,  
-      y: 0.0,  
-      z: 0.0,   
-      w: 1.0    
-    }
-  }
-}"
-ros2 topic pub /motion_target/target_pose_arm_right geometry_msgs/msg/PoseStamped \
-"{
-  header: {
-    stamp: {sec: 0, nanosec: 0},
-    frame_id: 'base_link'    
-  },
-  pose: {
-    position: {
-      x: 0.2,  
-      y: 0.25,  
-      z: -0.3   
-    },
-    orientation: {
-      x: 0.0,  
-      y: 0.0,  
-      z: 0.0,   
-      w: 1.0    
-    }
-  }
-}"+ros2 topic pub /motion_target/target_position_gripper_left sensor_msgs/msg/JointState '{header: {stamp: {sec: 0, nanosec: 0}, frame_id: ""}, name: ["R1PRO_left_gripper_joint"], position: [0.0]}'的控制指令
+2,目前支持单阶段奖励分类器（##无多阶段的奖励分类##）
+
+
+
+
+3,classifier_data目录下的pkl文件一起进入训练，所以保证pkl文件记录的状态：
+             ###########
+              是对应同一阶段的状态
+             ###########
+
+4,具体任务的config（和wrapper统计目录的config）：
+  （1）#############config的总默认设置
+    DefaultTrainingConfig是写死的参数，必须在这个config中修改
+
+
+  （2）#############config的其他默认配置
+    def get_environment(
+        self,
+        fake_env: bool = False,
+        save_video: bool = False,   
+        classifier: bool = False,   
+        use_vr: bool = True,
+    ):
+
+
+  （3）########是可调用的配置，如果其他脚本调用这个配置：
+    例如env = env_config.get_environment(
+        fake_env=False,
+        save_video=False,
+        classifier=False,
+    )
+                
+                ###################
+    则可以在其他脚本修改，如果没有调用，只能在config中修改
+        建议在其他脚本调用，这样config保持默认配置，其他脚本调用后按需要修改自己的配置
+                ######################
+
+
+5,总config（和mappings统计目录的config）：
+         #########################
+       总算法和接口等默认配置，不涉及具体任务 
+         #########################
+
+
+6,#env环境把任务参数全部外置到 config总路->具体任务下的config（在这里修改具体任务的所有配置），底层 env 只负责双臂控制、观测、显示、录像和安全裁剪；
+
+
+7,相机报错：
+先检查接口（接口不对报错）
+在还相机接口位置（接口插笔记本的位置不对会爆性能，插对位置才可以让三个相机共存）
+
+
+8,actor/learner 运行指令：
+
+python train_rlpd.py \
+  --exp_name=galaxea_usb_insertion_single \
+  --actor=True \
+  --ip=localhost \
+  --demo_path=./demo_data_single \
+  --checkpoint_path=./rlpd_checkpoints_single \
+  --debug=True
+
+
+9,更换任务后，按如下更改后可成功转换任务（涉及保存路径的修改都在对应生成代码的最后面的部分里有定义，在那里修改）：
+  （1）exp_name对应：
+     先选中设置的config_mapping里的配置类，
+     从而装配
+       env（单/双臂配置，更换本次任务需要的单/双臂的设置）；
+       wrapper（import的具体目标任务wrapper的正确路径）；
+       classifier（具体任务的config的代码下面有路径选择，填写本次任务需要导入的奖励分类器的ckpt，
+                         由于奖励分类器无纬度，只有相机，所以不容易发现，路径必须写对）；
+       rlpd（import的具体目标任务config的正确路径）；
+
+
+  （2）actor/learner=True对应：启动actor/learner
+
+  （3）ip：用来actor端连接learner端
+
+  （4）demo_path对应：
+    本次任务对应的专家演示demos保存的路径
+    actor/learner初始化demo里的数据确定双臂还是单臂等，后续的输入纬度和demo纬度对齐才会进行后续
+    所以demo录制脚本的demos保存文件夹需要按需要重新设置
+
+  （5）checkpoint_path 对应目录：rlpd_checkpoints_X
+           仅由启动指令中的 --checkpoint_path 决定路径
+
+rlpd_checkpoints_X/
+├── checkpoint_* 
+│   （由 learner 保存的 RL policy checkpoint；
+│    可用于断点续训；actor 的评估模式可读取该权重输出动作）
+│
+├── buffer/
+│   （由 actor 写入、learner 读入；
+│    存的是 actor 在环境中实际执行后得到的在线 transition，
+│    包括策略动作、随机动作，以及被人类接管后替换成 intervene_action 的动作）
+│
+└── demo_buffer/
+    （由 actor 写入、learner 读入；
+     主要存训练过程中的在线人类干预片段/intervention transitions；
+     不等同于最初通过 --demo_path 加载的离线 demos）
+
+     另外，提前录制的离线 demos 不在 checkpoint_path 里定义，
+     而是由 --demo_path 单独指定；learner 启动时会先加载这些离线 demos，
+    再结合 checkpoint_path 下的 buffer/ 和 demo_buffer/ 一起训练。
+
+
+10,数据来源：
+learner 启动时
+demo_buffer：先加载你录好的 demos
+replay_buffer：一开始通常是空的，除非你从旧的 checkpoint_path/buffer/ 恢复到历史在线数据
+actor 开始跑之后
+
+actor 才会开始生成新的在线数据，写进：
+
+buffer/
+learner 侧对应的 replay_buffer
