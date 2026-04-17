@@ -127,8 +127,8 @@ def main(_):
     sharding = jax.sharding.PositionalSharding(devices)
 
     # 先从数据集文件推断 spaces，彻底绕开真实环境
-    success_paths = glob.glob(os.path.join(os.getcwd(), "classifier_data", "*success*.pkl"))
-    failure_paths = glob.glob(os.path.join(os.getcwd(), "classifier_data", "*failure*.pkl"))
+    success_paths = glob.glob(os.path.join(os.getcwd(), "classifier_data_single", "*success*.pkl"))
+    failure_paths = glob.glob(os.path.join(os.getcwd(), "classifier_data_single", "*failure*.pkl"))
     observation_space, action_space = build_spaces_from_dataset(success_paths, failure_paths)
 
     # Create buffer for positive transitions
@@ -265,7 +265,7 @@ def main(_):
         )
 
     checkpoints.save_checkpoint(
-        os.path.join(os.getcwd(), "classifier_ckpt/"),
+        os.path.join(os.getcwd(), "classifier_ckpt_single/"),
         classifier,
         step=FLAGS.num_epochs,
         overwrite=True,

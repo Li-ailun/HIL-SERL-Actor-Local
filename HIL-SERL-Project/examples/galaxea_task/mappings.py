@@ -16,6 +16,6 @@
 from .usb_pick_insertion_single.config import GalaxeaUSBTrainConfig
 
 CONFIG_MAPPING = {
-    "galaxea_usb_insertion": GalaxeaUSBTrainConfig,
+    "galaxea_usb_insertion_single": GalaxeaUSBTrainConfig,
 }
 

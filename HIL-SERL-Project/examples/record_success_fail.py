@@ -133,7 +133,7 @@ def main(_):
     print("\n\n✅ 达到目标！停止录制。")
     listener.stop()
 
-    save_dir = os.path.join(os.path.dirname(__file__), "classifier_data")
+    save_dir = os.path.join(os.path.dirname(__file__), "classifier_data_single")
     os.makedirs(save_dir, exist_ok=True)
 
     uuid = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")

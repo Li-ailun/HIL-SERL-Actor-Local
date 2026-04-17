@@ -204,7 +204,7 @@ def main(_):
     # ==========================================================
     # 💾 保存数据
     # ==========================================================
-    save_dir = os.path.join(os.path.dirname(__file__), "demo_data")
+    save_dir = os.path.join(os.path.dirname(__file__), "demo_data_single")
     os.makedirs(save_dir, exist_ok=True)
 
     uuid = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
