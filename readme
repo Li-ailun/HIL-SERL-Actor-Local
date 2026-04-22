@@ -227,80 +227,59 @@ infos
 
 
 
-我给你整理一份这次本地新建 conda 环境 hilserl_actor_gpu_py310 里，我们明确安装/对齐过的版本清单。这个清单适合你后续复刻时参考。注意：我这里列的是这次搭环境过程中明确安装、回退、或最终对齐确认过的包，不是整个环境里所有包的完整 freeze。
+最新总结：
+整体是通的。
+结论分开说：
 
-1. 核心运行环境
-Python 3.10.20
-conda 环境名：hilserl_actor_gpu_py310
-JAX 设备：CudaDevice(id=0)，也就是本地 4060 GPU 已被识别并使用。
-2. 最终对齐到服务器的核心版本
+1）learner 正常在跑。
+它已经成功绑定 5588，先做了 warmup 阶段的重复发布，然后 replay buffer 填满后进入正式训练；之后在 step=50/100/150/200/250/300/350/400... 都持续做了 train_periodic_update 发布新网络。
 
-这组是最重要的，后续复刻优先参考这组：
+2）actor 也正常在跑。
+actor 这边已经完成了 GPU、相机、ROS2、底层服务连接、模式切换、奖励分类器 ckpt 恢复，并且真正进入了 starting actor loop，已经至少跑完两个 episode，还有正常的复位、VR 接管、脚本接管。
 
-jax==0.6.1
-jaxlib==0.6.1
-flax==0.10.7
-optax==0.2.8
-chex==0.1.90
-orbax-checkpoint==0.11.36
-distrax==0.1.5
-tensorflow==2.21.0
-tensorflow-probability==0.25.0
-tf-keras==2.21.0
-numpy==1.26.4
-3. JAX CUDA 12 GPU 相关
+3）learner 生成的网络，确实发给 actor 了；actor 也确实收到了。
+证据非常直接：
+learner 初始发布 checksum=8.368379，actor 第一次收到也是 8.368379，随后 actor 第一次应用的还是 8.368379。后面 learner 在 step=50 发布 8.407012，actor 的 recv_count=2 收到同一个值；step=100 发布 8.411232，actor 的 recv_count=3 收到同一个值；step=150/200/250/300/350/400 的 checksum 也都和 actor 的 recv_count=4/5/6/7/8/9 一一对上。
 
-这组是本地 GPU 跑 actor 的关键：
+4）actor 不只是收到了，还应用上了。
+日志里有明确的 actor-network-apply：
+初始网络 applied_count=1，之后 applied_count=2/3/4/5 也都和 learner 后续发布的新 checksum 对得上。到第二个 episode 结束时，actor 打印的是 recv_count=10, applied_count=10，这说明到那个时刻为止，前 10 次收到的网络都已经应用了。后面 recv_count 继续涨到 17，只是由于你现在最小化日志，后续 apply 没有每次都打印出来。
 
-jax-cuda12-pjrt==0.6.1
-jax-cuda12-plugin==0.6.1
-setuptools==81.0.0（压回 <82，避免之前的 pkg_resources 问题）
-protobuf==6.33.6（为了和当前其他依赖兼容）
-4. actor 主链路明确装过的 Python 包
+5）actor 往 learner 回传数据这条链也是通的。
+最强证据不是端口日志，而是 learner 端的数据变化：
+warmup 后 learner 的 replay_buffer=1018，随后继续增长到 1688/1853/2038/2198/2348/...，说明 actor 的 transition 确实在送到 learner。更直接的是，actor 第一个 episode 结束时打印：return=0.0000, length=1500, duration=179.368, intervention_steps=1229；learner 随后也打印了同一条 episode stats：return=0.0000, length=1500, duration=179.368, intervention_steps=1229。这说明 actor 的 episode 统计也确实发到了 learner。
 
-这些是你一路补依赖时明确装过、并且确实用到了的：
+6）但通信不是完全完美，有过短暂超时。
+actor 中间两次出现：
+Failed to send message to localhost:5588: 资源暂时不可用, potential timeout。这表示 actor 到 learner 的 REQ/REP 通道有过瞬时卡顿。好在它没有把系统打断，因为后面 learner 还是继续训练、继续发布网络，actor 也继续收到 recv_count=2/3/4/.../17。所以这是有小毛刺，但整体可用。
 
-agentlace==0.1.3
-来源：git+https://github.com/youliangtan/agentlace.git@cf2c337c5e3694cdbfc14831b239bd657bc4894d
-serl_launcher==0.1.2（editable 安装）
-gym==0.26.2
-gymnasium==0.29.1
-natsort==8.4.0
-tqdm==4.67.3
-absl-py==2.4.0
-ml-collections==1.1.0
-msgpack==1.1.2
-opencv-python==4.10.0.84
-pyrealsense2==2.57.7.10387
-einops==0.8.2
-matplotlib==3.10.8
-imageio==2.37.2
-wandb==0.23.0
-loguru==0.7.3
-5. 额外明确装过的常用依赖
+7）奖励分类器 ckpt 也成功加载了。
+actor 初始化时已经明确恢复了：
+Restoring orbax checkpoint from .../classifier_ckpt_single/checkpoint_150，并在很短时间内完成加载。
 
-这些也是这次过程中明确装进来的：
+8）唯一还不能说“已经学好了”的，是任务表现。
+虽然系统链路已经通了，但当前训练效果还没起来：
 
-jinja2==3.1.6
-networkx==3.4.2
-sympy==1.14.0
-keras==3.12.1
-h5py==3.14.0
-grpcio==1.80.0
-requests==2.33.1
-rich==15.0.0
-tensorstore==0.1.78
-dm-tree==0.1.10
-etils==1.13.0
-ml_dtypes==0.5.4
-scipy==1.15.3
-opt_einsum==3.4.0
-PyYAML==6.0.3
-6. 当前运行状态已经确认的事
+actor 已经跑完两个 episode，都是 return=0.0000, success=0.0，而且 intervention 很多；learner 端收到的 episode stats 也是 0 回报。说明现在是系统正常运转，但策略还没学出成功行为。
 
-你现在这套环境已经确认能做到：
+下一步：
+一，解决延迟：
+首先本来就是异步运行：actor把数据发给learner，learner每固定步把网络发给actor更新actor的动作策略。
+（1）actor通过REQ/REP传给learner的数据会卡顿，但好像只要传过去就可以，如果有影响就修改
+（2）learner每五十（自己设置的）步传给actor最新网络，actor通过ssh接受应用的延迟在0.025s左右，最慢0.053，如果有影响就修改
 
-python 指向 hilserl_actor_gpu_py310
-jax devices = [CudaDevice(id=0)]
-rclpy 可导入
-actor 能启动到环境、相机、ROS2 bridge、VR 模式切换、奖励分类器 ckpt 恢复、actor loop 运行这些阶段。
+二，需要解决：
+（1）actor会卡顿一下的原因
+（2）夹爪定义
+（3）数据转换
+（4）sac涉及视觉输入吗？还是只有奖励分类器使用了视觉？
+（5）learner更新网络的速度（目前两张4090,速度3,4it/s）：
+可以减少图像输入，降低图像分辨率
+
+
+办法：
+（1）奖励输入画面和策略输入画面不需要一样，画面是两条路线输入的，
+所以可以奖励用一组画面(用于判定奖励)，推理用另一组画面（用于看画面输出动作）
+所以我怀疑侧面一个相机即可实现奖励判定，
+推理必须出现夹爪和场景关键点才可以合理输出动作
+目前我的奖励和推理都公用三个画面，但是画面只有腕部相机可以看到夹爪，另外两个画面只能看到usb和插孔，看不到机器人夹爪和右臂

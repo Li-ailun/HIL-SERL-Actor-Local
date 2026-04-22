@@ -9,6 +9,12 @@
 
 
 #  /home/eren/HIL-SERL/HIL-SERL-Project/examples/sh/run_actor_gpu_ros.sh
+
+# ssh -p 2122 \
+#   -L 5588:localhost:5588 \
+#   -L 5589:localhost:5589 \
+#   lixiang@service.qich.top
+
 import os
 import sys
 import glob
