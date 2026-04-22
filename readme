@@ -223,3 +223,84 @@ infos
 夹爪：修改， 自己定义量程范围规定张开还是闭合并改成稳定的值（-1/+1），反推到标签张开还是闭合（+1/-1）
     自己的机器人状态是瞬时的，只有一瞬间的信号，这样会让hil认为大多时间都在张开，一瞬间闭合，太难学习
 修改：录制脚本+actor收集在线数据这两个脚本需要随之修改，从而让标签对应状态和官网一样
+
+
+
+
+我给你整理一份这次本地新建 conda 环境 hilserl_actor_gpu_py310 里，我们明确安装/对齐过的版本清单。这个清单适合你后续复刻时参考。注意：我这里列的是这次搭环境过程中明确安装、回退、或最终对齐确认过的包，不是整个环境里所有包的完整 freeze。
+
+1. 核心运行环境
+Python 3.10.20
+conda 环境名：hilserl_actor_gpu_py310
+JAX 设备：CudaDevice(id=0)，也就是本地 4060 GPU 已被识别并使用。
+2. 最终对齐到服务器的核心版本
+
+这组是最重要的，后续复刻优先参考这组：
+
+jax==0.6.1
+jaxlib==0.6.1
+flax==0.10.7
+optax==0.2.8
+chex==0.1.90
+orbax-checkpoint==0.11.36
+distrax==0.1.5
+tensorflow==2.21.0
+tensorflow-probability==0.25.0
+tf-keras==2.21.0
+numpy==1.26.4
+3. JAX CUDA 12 GPU 相关
+
+这组是本地 GPU 跑 actor 的关键：
+
+jax-cuda12-pjrt==0.6.1
+jax-cuda12-plugin==0.6.1
+setuptools==81.0.0（压回 <82，避免之前的 pkg_resources 问题）
+protobuf==6.33.6（为了和当前其他依赖兼容）
+4. actor 主链路明确装过的 Python 包
+
+这些是你一路补依赖时明确装过、并且确实用到了的：
+
+agentlace==0.1.3
+来源：git+https://github.com/youliangtan/agentlace.git@cf2c337c5e3694cdbfc14831b239bd657bc4894d
+serl_launcher==0.1.2（editable 安装）
+gym==0.26.2
+gymnasium==0.29.1
+natsort==8.4.0
+tqdm==4.67.3
+absl-py==2.4.0
+ml-collections==1.1.0
+msgpack==1.1.2
+opencv-python==4.10.0.84
+pyrealsense2==2.57.7.10387
+einops==0.8.2
+matplotlib==3.10.8
+imageio==2.37.2
+wandb==0.23.0
+loguru==0.7.3
+5. 额外明确装过的常用依赖
+
+这些也是这次过程中明确装进来的：
+
+jinja2==3.1.6
+networkx==3.4.2
+sympy==1.14.0
+keras==3.12.1
+h5py==3.14.0
+grpcio==1.80.0
+requests==2.33.1
+rich==15.0.0
+tensorstore==0.1.78
+dm-tree==0.1.10
+etils==1.13.0
+ml_dtypes==0.5.4
+scipy==1.15.3
+opt_einsum==3.4.0
+PyYAML==6.0.3
+6. 当前运行状态已经确认的事
+
+你现在这套环境已经确认能做到：
+
+python 指向 hilserl_actor_gpu_py310
+jax devices = [CudaDevice(id=0)]
+rclpy 可导入
+actor 能启动到环境、相机、ROS2 bridge、VR 模式切换、奖励分类器 ckpt 恢复、actor loop 运行这些阶段。
