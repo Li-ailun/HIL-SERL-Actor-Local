@@ -1,3 +1,6 @@
+#chmod +x /home/eren/HIL-SERL/HIL-SERL-Project/examples/sh/run_actor_gpu_ros.sh
+#后
+#/home/eren/HIL-SERL/HIL-SERL-Project/examples/sh/run_actor_gpu_ros.sh
 #!/usr/bin/env bash
 set -eo pipefail
 

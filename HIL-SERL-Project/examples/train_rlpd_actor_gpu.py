@@ -1,3 +1,14 @@
+#rlpd的继续说明，
+#gpu后，现在8~14 it/s，和之前 CPU 的 3~4 it/s 相比，符合这个变化。
+#learner更新50步网络后，会发给actor最新的网络，所以actor在接受新网络后会卡顿（0.05级别的延迟）一下再继续输出动作
+# 当前 step 先按当前已经生效的网络跑完
+# 新网络先收进来，到下一次安全点 loop_start 再切换，下一步开始才用新网络出动作
+# 对一个具体 step 来说，动作要么是：
+#  旧网络输出的完整动作
+#  要么是新网络输出的完整动作，不会在“收到包的那一瞬间”还持续记录一串冻结动作。
+
+
+#  /home/eren/HIL-SERL/HIL-SERL-Project/examples/sh/run_actor_gpu_ros.sh
 import os
 import sys
 import glob
