@@ -126,13 +126,13 @@ class GalaxeaUSBEnvConfig:
     # ==============================
     RESET_POSE = np.array(
         [
-            0.31728635015134854,
-            -0.3061865364134424,
-            -0.13054431501184297,
-            0.013798754839754589,
-            -0.07602081420421326,
-            -0.006189825615894724,
-            0.9969915326779089,
+            0.2,
+            -0.3,
+            -0.15,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
         ],
         dtype=np.float32,
     )
@@ -142,9 +142,10 @@ class GalaxeaUSBEnvConfig:
     RESET_GRIPPER = 80.0
 
     # reset 轨迹时长（秒）
-    RESET_TIMEOUT_SEC = 3.0
+    # #由wrapper真实决定（wrapper的go to reset）
+    #RESET_TIMEOUT_SEC = 2.0
 
-    # reset 扰动
+    # reset 扰动（config里生效，不是由wrapper决定）
     RANDOM_RESET = True
     RANDOM_XY_RANGE = 0.01
 
@@ -160,9 +161,9 @@ class GalaxeaUSBEnvConfig:
     # 3. 图像 / 显示配置
     # 三相机全部保留
     # ==============================
-    #ENV_IMAGE_KEYS 是“环境里有哪些图可用”。
+    #ENV_IMAGE_KEYS 是“环境里有哪些图可用”。决定demos和classifer_data录制的相机个数
     ENV_IMAGE_KEYS = ["head_rgb", "left_wrist_rgb", "right_wrist_rgb"]
-    #DISPLAY_IMAGE_KEYS 只是显示顺序，
+    #DISPLAY_IMAGE_KEYS 只是显示顺序，改变可视化界面的相机个数
     DISPLAY_IMAGE_KEYS = ["left_wrist_rgb", "head_rgb", "right_wrist_rgb"]
 
     #最终送进网络的分辨率。下面的dim等是先输入的分辨率，
@@ -192,7 +193,7 @@ class GalaxeaUSBEnvConfig:
     }
 
     HEAD_CAMERA = {
-        "device_index": 2,   # 用 v4l2-ctl --list-devices 查询
+        "device_index": 14,   # 用 v4l2-ctl --list-devices 查询
         "api": cv2.CAP_V4L2,
         "fourcc": "MJPG",
         "frame_width": 1344,
@@ -207,6 +208,7 @@ class GalaxeaUSBEnvConfig:
     # ==============================
     POS_SCALE = 0.01   # 0.01 m
     ROT_SCALE = 0.05   # 0.05 rad
+    #夹爪不缩放，我和官方都是手臂和夹爪先clip，然后手臂缩放，夹爪直接action【6】映射成标签对应的夹爪动作
 
     # ==============================
     # 6. 安全工作空间限位
@@ -269,13 +271,14 @@ class GalaxeaUSBTrainConfig(DefaultTrainingConfig):
     # ==============================
     # 9. 观测 / 编码配置
     # ==============================
-    #RL 训练主输入看 image_keys
-    image_keys: List[str] = ["head_rgb", "left_wrist_rgb", "right_wrist_rgb"]
+    #RL 训练主输入看 image_keys，但不决定demos录制用这几个录制
+    image_keys: List[str] = ["head_rgb", "right_wrist_rgb"]
 
     # 单臂右臂任务更建议分类器关注 head + right wrist
-    # 奖励分类器看 classifier_keys
-    classifier_keys: List[str] = ["head_rgb", "left_wrist_rgb", "right_wrist_rgb"]
-
+    # 奖励分类器看 classifier_keys，奖励分类只看如下图像，但是不决定录制数据用这几个图像采集
+    # classifier_keys: List[str] = ["head_rgb", "left_wrist_rgb", "right_wrist_rgb"]
+    classifier_keys: List[str] = ["head_rgb", "left_wrist_rgb"]
+    # classifier_keys: List[str] = ["left_wrist_rgb"]
     proprio_keys: List[str] = [
         "right_ee_pose",
         "right_gripper",

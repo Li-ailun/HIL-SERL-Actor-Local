@@ -135,7 +135,7 @@ class GalaxeaUSBEnv(GalaxeaArmEnv):
         if self.use_vr:
             print("💡 【请按 VR 手柄的 Mode 2 键】切到脚本控制模式（会发送 use_vr_mode=False）")
             self._wait_until_script_control_ready(timeout=15.0)
-            self._wait_extra_after_false(delay=3.0)
+            self._wait_extra_after_false(delay=2.0)
             print("🤖 [USB Task Single Arm] 开始向底层发送复位坐标...")
         else:
             print("🤖 [USB Task Single Arm] 当前为无 VR 模式，直接发送复位轨迹...")
@@ -156,6 +156,75 @@ class GalaxeaUSBEnv(GalaxeaArmEnv):
 
         if self.use_vr:
             print("💡 【请按 VR 手柄的 Mode 0 键】重新夺回机械臂控制权，开始你的表演！")
+
+    
+    # def go_to_reset(self):
+    #     """
+    #     reset 新逻辑（固定目标重复发布版）：
+    #     1) use_vr=True 时，先等手柄切到 Mode 2
+    #        - VRInterventionWrapper 会在 control_mode=2 时发送 use_vr_mode=False
+    #     2) 不再做插值轨迹
+    #     3) 连续 2 秒重复发布同一个 reset_pose + reset_gripper
+    #        - 目的：像你手动 ros2 topic pub --rate 30 那样，稳定压住 target
+    #       4) use_vr=False 时，直接执行同样的固定目标重复发布
+    #     """
+    #     print("🤖 [USB Task Single Arm] 正在准备复位...")
+
+    #     reset_pose = self._build_reset_target()
+
+    # # 你要求：固定发送 2 秒
+    #     hold_sec = 5.0
+
+    #     if self.use_vr:
+    #         print("💡 【请按 VR 手柄的 Mode 2 键】切到脚本控制模式（会发送 use_vr_mode=False）")
+    #         self._wait_until_script_control_ready(timeout=15.0)
+
+    #     # 保留这一步，让模式切换完全稳定下来
+    #         self._wait_extra_after_false(delay=1.0)
+
+    #         print("🤖 [USB Task Single Arm] 开始向底层连续发送固定复位目标...")
+    #     else:
+    #         print("🤖 [USB Task Single Arm] 当前为无 VR 模式，直接连续发送固定复位目标...")
+
+    # # ===== 固定目标重复发布版：不插值 =====
+    # # 尽量贴近你手动 `ros2 topic pub --rate 30 ...` 的思路
+    #     start_t = time.time()
+    #     send_count = 0
+    #     period = 1.0 / float(self.hz)
+   
+    #     while time.time() - start_t < hold_sec:
+    #         step_start = time.time()
+
+    #         self._send_ros_pose(
+    #             self.arm_side,
+    #             reset_pose,
+    #             self.reset_gripper,
+    #         )
+    #         send_count += 1
+
+    #         dt = time.time() - step_start
+    #         time.sleep(max(0.0, period - dt))
+
+    # # 再补发一次，确保最后一个 target 是你想要的 reset_pose
+    #     self._send_ros_pose(
+    #         self.arm_side,
+    #         reset_pose,
+    #         self.reset_gripper,
+    #     )
+
+    # # 同步一次观测，避免状态滞后
+    #     self._get_sync_obs()
+
+    #     print(
+    #         f"✅ 单臂固定复位目标发送完成！"
+    #         f" pose={np.round(reset_pose, 4).tolist()}, "
+    #         f"gripper={self.reset_gripper}, "
+    #         f"hold_sec={hold_sec}, send_count={send_count + 1}"
+    #     )
+
+    #     if self.use_vr:
+    #         print("💡 【请按 VR 手柄的 Mode 0 键】重新夺回机械臂控制权，开始你的表演！")    
+
 
 
 class SingleGripperPenaltyWrapper(gym.Wrapper):

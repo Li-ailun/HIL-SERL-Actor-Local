@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -eo pipefail
+#chmod +x /home/eren/HIL-SERL/HIL-SERL-Project/examples/sh/run_record_success_fail_ros.sh
+#后
+#/home/eren/HIL-SERL/HIL-SERL-Project/examples/sh/run_record_success_fail_ros.sh
+
 
 cd /home/eren/HIL-SERL/HIL-SERL-Project/examples
 
