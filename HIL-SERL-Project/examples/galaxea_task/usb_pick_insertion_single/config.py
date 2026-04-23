@@ -141,10 +141,6 @@ class GalaxeaUSBEnvConfig:
     # 你要求“张开定义成 80”
     RESET_GRIPPER = 80.0
 
-    # reset 轨迹时长（秒）
-    # #由wrapper真实决定（wrapper的go to reset）
-    #RESET_TIMEOUT_SEC = 2.0
-
     # reset 扰动（config里生效，不是由wrapper决定）
     RANDOM_RESET = True
     RANDOM_XY_RANGE = 0.01
