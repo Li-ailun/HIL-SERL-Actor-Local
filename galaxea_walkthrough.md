@@ -407,7 +407,7 @@ demos 和 RLPD 的夹爪保存定义是统一的。
         ↓
     <=30 判定为 closed
     >=70 判定为 open
-    30~70 保持上一稳定状态
+    30~70 保持上一稳定状态（为了覆盖量程，这个范围几乎不会存在，迅速掠过）
         ↓
     比较 obs -> next_obs 的状态变化
         ↓
@@ -418,3 +418,19 @@ demos 和 RLPD 的夹爪保存定义是统一的。
 
 这个比直接相信 policy_raw 或 intervene_action 更可靠，因为它记录的是夹爪实际发生了什么，不是“命令想让夹爪做什么”。
 （但要加一个前提：夹爪反馈本身可靠，且 CLOSE_MAX=30、OPEN_MIN=70 阈值适合你的真实硬件。(可视化观察闭合后夹爪量程是否仍小于30)）
+
+
+
+###
+###
+###
+
+
+
+###########################知识十五（wandb）
+
+learner端支持wandb，先登陆：
+（1）wandb 
+（2）输入key：loginwandb_v1_8Uf8krEtedBNwL62O6QBNeaBoRK_miAJZd1wqF00VrFsvbfxKCcOXUITWtOVeOUvkFIPAR40sWZnT
+（3）输入指令：
+python train_rlpd.py   --exp_name=galaxea_usb_insertion_single   --learner=True   --ip=localhost   --demo_path=./demo_data_single   --checkpoint_path=./rlpd_checkpoints_single   --debug=False
