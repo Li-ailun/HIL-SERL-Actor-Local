@@ -1,16 +1,5 @@
-#需要Ros2Bridge
-#需要vr介入
-#即：
-# 走真实环境导入链。
-# 所以一路导到：
-# wrapper.py
-# dual_galaxea_env.py
-# rs_capture.py
-#
+#按照三路相机拍摄即可，反正训练的时候可以选择只训练哪些相机
 
-# （1）成功画面要准，
-# （2）类似成功但是实际失败的画面必须要多，
-# （3）失败画面必须比成功画面多很多
 
 import os
 import sys
@@ -32,32 +21,55 @@ if PROJECT_ROOT not in sys.path:
 
 from examples.galaxea_task.usb_pick_insertion_single.config import env_config
 
+
 FLAGS = flags.FLAGS
+
 flags.DEFINE_string(
     "exp_name",
     "galaxea_usb_insertion_single",
     "Name of experiment corresponding to folder.",
 )
+
 flags.DEFINE_integer(
     "successes_needed",
     200,
     "Number of successful transitions to collect.",
 )
+
 flags.DEFINE_integer(
     "pre_success_frames",
     3,
     "Number of frames before SPACE to also label as success.",
 )
+
 flags.DEFINE_integer(
     "post_success_frames",
     3,
     "Number of frames after SPACE to also label as success.",
 )
+
 flags.DEFINE_float(
     "failure_hz",
     10.0,
     "Sampling frequency for negative samples.",
 )
+
+flags.DEFINE_string(
+    "classifier_image_keys",
+    "__config__",
+    (
+        "Comma-separated image keys to save for reward classifier data. "
+        "'__config__' means use env_config.classifier_keys. "
+        "'all' means keep all observation image keys."
+    ),
+)
+
+flags.DEFINE_boolean(
+    "classifier_strict_obs_keys",
+    True,
+    "If True, raise error when requested classifier image key is missing.",
+)
+
 
 # ==========================================================
 # 键盘状态
@@ -96,6 +108,7 @@ def on_press(key):
 
 def on_release(key):
     global space_is_down, a_is_down
+
     try:
         with key_lock:
             if key == keyboard.Key.space:
@@ -111,19 +124,158 @@ def on_release(key):
 
 
 # ==========================================================
+# classifier 图像 key 解析 / obs 裁剪
+# ==========================================================
+def parse_key_list(raw_value, default_keys=None, allow_all=False):
+    """
+    解析逗号分隔 key 列表。
+
+    - "__config__" -> default_keys
+    - "all"        -> None，表示不裁剪
+    - "none"       -> []
+    """
+    if raw_value is None:
+        return list(default_keys or [])
+
+    value = str(raw_value).strip()
+
+    if value == "__config__":
+        return list(default_keys or [])
+
+    if allow_all and value.lower() == "all":
+        return None
+
+    if value.lower() in ("none", "null", ""):
+        return []
+
+    return [x.strip() for x in value.split(",") if x.strip()]
+
+
+def get_classifier_storage_image_keys():
+    return parse_key_list(
+        FLAGS.classifier_image_keys,
+        default_keys=getattr(env_config, "classifier_keys", []),
+        allow_all=True,
+    )
+
+
+def _get_obs_value(obs, key):
+    """
+    支持两种 observation 结构：
+    1. obs[key]
+    2. obs["images"][key]
+    """
+    if key in obs:
+        return obs[key]
+
+    if "images" in obs and isinstance(obs["images"], dict) and key in obs["images"]:
+        return obs["images"][key]
+
+    raise KeyError(
+        f"observation 中找不到 key='{key}'。当前 obs keys={list(obs.keys())}"
+    )
+
+
+def prune_obs_for_classifier_storage(obs, classifier_image_keys, strict=True):
+    """
+    只裁剪“保存到 reward classifier pkl 里的 obs”。
+
+    classifier_image_keys=None 表示保留完整 obs。
+    classifier_image_keys=[...] 表示只保留这些图像 key。
+    """
+    if obs is None:
+        return obs
+
+    if not isinstance(obs, dict):
+        return obs
+
+    if classifier_image_keys is None:
+        return copy.deepcopy(obs)
+
+    keep = {}
+
+    for key in classifier_image_keys:
+        try:
+            keep[key] = _get_obs_value(obs, key)
+        except KeyError:
+            if strict:
+                raise
+            print(f"⚠️ classifier 数据保存时跳过缺失图像 key={key}")
+
+    return keep
+
+
+def prune_transition_for_classifier_storage(trans, classifier_image_keys, strict=True):
+    """
+    裁剪 transition 里的 observations / next_observations。
+    """
+    trans = copy.deepcopy(trans)
+
+    if "observations" in trans:
+        trans["observations"] = prune_obs_for_classifier_storage(
+            trans["observations"],
+            classifier_image_keys=classifier_image_keys,
+            strict=strict,
+        )
+
+    if "next_observations" in trans:
+        trans["next_observations"] = prune_obs_for_classifier_storage(
+            trans["next_observations"],
+            classifier_image_keys=classifier_image_keys,
+            strict=strict,
+        )
+
+    return trans
+
+
+def print_obs_keys_summary(transitions, name="classifier_data"):
+    if not transitions:
+        print(f"⚠️ {name}: empty")
+        return
+
+    obs = transitions[0].get("observations", {})
+    next_obs = transitions[0].get("next_observations", {})
+
+    print("\n===== reward classifier 数据 observation keys 检查 =====")
+    print(f"{name} observations keys     : {list(obs.keys()) if isinstance(obs, dict) else type(obs)}")
+    print(f"{name} next_observations keys: {list(next_obs.keys()) if isinstance(next_obs, dict) else type(next_obs)}")
+
+
+# ==========================================================
 # 工具函数
 # ==========================================================
-def make_transition(obs, actions, next_obs, rew, done):
-    return copy.deepcopy(
-        dict(
-            observations=obs,
-            actions=np.asarray(actions, dtype=np.float32),
-            next_observations=next_obs,
-            rewards=rew,
-            masks=1.0 - float(done),
-            dones=bool(done),
-        )
+def make_transition(obs, actions, next_obs, rew, done, classifier_image_keys):
+    """
+    reward classifier 数据 transition。
+
+    注意：
+    - env.step() 内部可以仍然拿完整 obs。
+    - 但保存到 pkl 之前，只保留 classifier_image_keys。
+    """
+    transition = dict(
+        observations=prune_obs_for_classifier_storage(
+            obs,
+            classifier_image_keys=classifier_image_keys,
+            strict=FLAGS.classifier_strict_obs_keys,
+        ),
+        actions=np.asarray(actions, dtype=np.float32),
+        next_observations=prune_obs_for_classifier_storage(
+            next_obs,
+            classifier_image_keys=classifier_image_keys,
+            strict=FLAGS.classifier_strict_obs_keys,
+        ),
+        rewards=rew,
+        masks=1.0 - float(done),
+        dones=bool(done),
     )
+
+    transition = prune_transition_for_classifier_storage(
+        transition,
+        classifier_image_keys=classifier_image_keys,
+        strict=FLAGS.classifier_strict_obs_keys,
+    )
+
+    return copy.deepcopy(transition)
 
 
 def add_success_transition(transition, successes, pbar, success_needed):
@@ -139,8 +291,24 @@ def flush_pending_failures(pending_failures, failures):
         failures.append(pending_failures.popleft())
 
 
+def sanitize_transition_list_for_classifier_storage(transitions, classifier_image_keys):
+    return [
+        prune_transition_for_classifier_storage(
+            t,
+            classifier_image_keys=classifier_image_keys,
+            strict=FLAGS.classifier_strict_obs_keys,
+        )
+        for t in transitions
+    ]
+
+
+# ==========================================================
+# 主函数
+# ==========================================================
 def main(_):
     global success_presses, unlock_failure_presses
+
+    classifier_image_keys = get_classifier_storage_image_keys()
 
     print(f"🚀 开始采集视觉分类器数据：{FLAGS.exp_name}")
     print("💡 操作指南：")
@@ -153,7 +321,16 @@ def main(_):
     print("      - 同时锁定失败采集，避免成功后续画面被误标为失败")
     print("   5. 当你确认已经离开成功状态后，按一次【A】恢复失败采集。")
     print("   6. 长按 SPACE / A 都不会连发，必须松开后再次按下才会再触发。")
-    print("   7. 新增：若当前仍处于 Mode 2 / 脚本控制阶段，则暂停 step，不继续发动作。\n")
+    print("   7. Mode 2 / 脚本控制阶段会暂停 step，不继续发动作。")
+    print("   8. 保存 reward classifier 数据时，只保存 classifier_keys 对应图像。\n")
+
+    print("===== 当前 reward classifier 数据保存配置 =====")
+    print(f"env_config.ENV_IMAGE_KEYS      = {getattr(env_config, 'ENV_IMAGE_KEYS', None)}")
+    print(f"env_config.image_keys          = {getattr(env_config, 'image_keys', None)}")
+    print(f"env_config.classifier_keys     = {getattr(env_config, 'classifier_keys', None)}")
+    print(f"classifier_image_keys          = {classifier_image_keys if classifier_image_keys is not None else 'all'}")
+    print(f"classifier_strict_obs_keys     = {FLAGS.classifier_strict_obs_keys}")
+    print("==============================================\n")
 
     listener = keyboard.Listener(
         on_press=on_press,
@@ -187,12 +364,9 @@ def main(_):
 
     try:
         while len(successes) < success_needed:
-            # ==================================================
-            # 关键新增逻辑：
-            # 和 demos 脚本对齐
-            # Mode 2 / script_control_enabled=True 时，不继续 env.step()
-            # ==================================================
             base_env = env.unwrapped
+
+            # Mode 2 / script_control_enabled=True 时，不继续 env.step()
             if getattr(base_env, "script_control_enabled", False):
                 time.sleep(0.05)
                 continue
@@ -201,7 +375,7 @@ def main(_):
             next_obs, rew, done, truncated, info = env.step(actions)
 
             if "intervene_action" in info:
-                actions = info["intervene_action"]
+                actions = np.asarray(info["intervene_action"], dtype=np.float32)
 
             transition = make_transition(
                 obs=obs,
@@ -209,7 +383,11 @@ def main(_):
                 next_obs=next_obs,
                 rew=rew,
                 done=done,
+                classifier_image_keys=classifier_image_keys,
             )
+
+            # 注意：这里 obs 保持完整 next_obs，不要用裁剪后的 transition["next_observations"]。
+            # 因为下一步 make_transition 仍然需要完整 obs，后续如果扩展也更安全。
             obs = next_obs
 
             trigger_success = False
@@ -314,14 +492,29 @@ def main(_):
             f"丢弃 {len(pending_failures)} 张挂起失败帧，避免标签污染。"
         )
 
+    # 最终保存前再保险裁剪一次
+    successes = sanitize_transition_list_for_classifier_storage(
+        successes,
+        classifier_image_keys=classifier_image_keys,
+    )
+    failures = sanitize_transition_list_for_classifier_storage(
+        failures,
+        classifier_image_keys=classifier_image_keys,
+    )
+
+    print_obs_keys_summary(successes, name="successes")
+    print_obs_keys_summary(failures, name="failures")
+
     save_dir = os.path.join(os.path.dirname(__file__), "classifier_data_single")
     os.makedirs(save_dir, exist_ok=True)
 
     uuid = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
+    key_tag = "all" if classifier_image_keys is None else "-".join(classifier_image_keys)
+
     success_file = os.path.join(
         save_dir,
-        f"{FLAGS.exp_name}_{len(successes)}_success_images_{uuid}.pkl",
+        f"{FLAGS.exp_name}_{len(successes)}_success_images_{key_tag}_{uuid}.pkl",
     )
     with open(success_file, "wb") as f:
         pkl.dump(successes, f)
@@ -329,7 +522,7 @@ def main(_):
 
     failure_file = os.path.join(
         save_dir,
-        f"{FLAGS.exp_name}_{len(failures)}_failure_images_{uuid}.pkl",
+        f"{FLAGS.exp_name}_{len(failures)}_failure_images_{key_tag}_{uuid}.pkl",
     )
     with open(failure_file, "wb") as f:
         pkl.dump(failures, f)
@@ -339,6 +532,8 @@ def main(_):
 if __name__ == "__main__":
     app.run(main)
 
+
+    
 # import os
 # import sys
 # import time

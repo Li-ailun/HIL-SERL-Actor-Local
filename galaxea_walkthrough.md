@@ -248,6 +248,9 @@ reset 是直接给绝对目标位姿，不是模型输出动作再 clip/scale。
 
 
 ########################知识八（bug）
+
+#####
+      （bug1）
 如果Mode 2 / script_control_enabled=True 时继续 env.step()，同时等待切回 Mode 0，会造成等待mode0前末端自己运动。
 如果Mode 2 / script_control_enabled=True 时不再继续 env.step()，只等待切回 Mode 0。末端不会自己动。
 目前demos脚本和奖励数据脚本都这么修改从而不让末端自己移动了
@@ -266,6 +269,12 @@ env.step(actions)（零增量的意思）
 
 所以不影响actor，因为actor不发布零增量，发布的是网络认为应该输出的增量，所以不会发生这个问题。
 所以只在demos脚本和奖励数据脚本去除发布零增量等待mode0,改成完全静默无动作，等待mode0来临即可。
+
+
+#####
+      （bug2）
+
+demos数据可视化后可以发现，把reset过程中的一帧进行录制了，不知道影响大不大？
 
 
 #####
@@ -317,3 +326,51 @@ success=0 是日志/info 字段没统一，不是 reward 没触发。
 你现在最应该立刻修的是：
 
 success 字段统一 + stored_actions[:6] clip 到 [-1,1]
+
+
+####
+####
+####
+
+
+###############################知识十一（相机输入）
+  总结：按照奖励数据，demos，rlpd需要最大的相机打开ENV_IMAGE_KEYS
+           即：
+              （1）都使用最大个数相机录制数据，
+              （2）rlpd和classifer时选择合适的相机作为输入。
+
+具体任务的config：
+###表示本任务环境实际打开/采集哪些相机。后面的 demo、reward classifier、RLPD policy 都只能从这里面选。所以它应该覆盖本任务所有脚本里需要用到的最大相机集合。
+1,ENV_IMAGE_KEYS = ["head_rgb", "left_wrist_rgb", "right_wrist_rgb"]
+
+###表示 RLPD actor/critic 策略网络实际吃哪几路图像。demo 里可以有三路，但只要至少包含这里需要的两路，RL 训练就可以只用两路。
+2,image_keys = ["head_rgb", "right_wrist_rgb"]
+
+###表示奖励分类器实际吃哪几路图像。你 classifier 是三路训练出来的，所以 RLPD 在线训练时也要给它三路 obs。
+3,classifier_keys = ["head_rgb", "left_wrist_rgb", "right_wrist_rgb"]
+
+
+###
+###
+###
+
+
+#######################知识十二（训练速度提升）
+
+（1）ENV_IMAGE_KEYS多+image_keys 少，可以提升learner+actor侧训练速度。
+（2）ENV_IMAGE_KEYS少+image_keys 少，可以进一步提升actor训练速度（减轻了图像处理压力），learner侧几乎不影响。
+   但是classifer必须重新训练成ENV_IMAGE_KEYS对应的相机个数
+  
+（3）有时候actor输出动作特别慢：考虑ssh连接问题  +  服务器显卡和别人公用，功率极大下降
+
+
+###
+###
+###
+
+#####################知识十三（检查数据）
+
+
+（1）检查demos图像和数据
+（2）检查buffer的图像和数据，归一化，夹爪，奖励
+（3）图像不要公用，各取所需，采集数据的时候也是

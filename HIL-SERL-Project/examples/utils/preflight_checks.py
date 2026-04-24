@@ -1,6 +1,0 @@
-assert_exp_name_registered(exp_name, config_mapping)
-assert_demo_pkl_matches_config(demo_path, config)
-assert_env_spaces_match_config(env, config)
-assert_classifier_keys_exist(config, obs_sample)
-assert_checkpoint_dir_layout(checkpoint_path)
-assert_action_shape_matches_mode(action_dim, config)
