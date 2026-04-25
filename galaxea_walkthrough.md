@@ -434,3 +434,52 @@ learner端支持wandb，先登陆：
 （2）输入key：loginwandb_v1_8Uf8krEtedBNwL62O6QBNeaBoRK_miAJZd1wqF00VrFsvbfxKCcOXUITWtOVeOUvkFIPAR40sWZnT
 （3）输入指令：
 python train_rlpd.py   --exp_name=galaxea_usb_insertion_single   --learner=True   --ip=localhost   --demo_path=./demo_data_single   --checkpoint_path=./rlpd_checkpoints_single   --debug=False
+
+###
+###
+###
+
+
+##########################  与官网区别（2026.4.25）
+
+第二：process_demos() 过滤零动作。
+这个可能误删 hold/成功附近静止帧。建议改成 return list(transitions)。
+
+第三：动作缩放和限位。
+POS_SCALE/ROT_SCALE 是环境语义，必须固定；它和官网不同没问题，但改了就要重录/清 buffer。
+
+第四：reset 起点分布。
+你的 VR Mode 2 + script reset 和官网 Franka reset 差异大。只要 reset 稳定且不污染数据，就可以；否则训练会很受影响。
+
+第五：proprio 更少。
+你少了速度/力/力矩，可能影响接触插入阶段学习。不是必须改，但如果接触阶段学不好，这是候选原因。
+
+第六：夹爪 penalty。
+现在 wrapper 思路已经和官网一致，主要剩下 penalty 大小和阈值适配。这个可以后看，不是当前最大差异。
+
+
+你的最新 train_rlpd.py 已经包含：
+✅ actor_to_learner 图像裁剪
+✅ 在线 action 归一化
+✅ 在线 gripper 事件标签重写
+✅ demos 加载清洗
+✅ actor/learner 网络同步稳定逻辑
+✅ grasp_penalty 单独存入 transition
+
+目前这份 RLPD 从结构上看，和我们前面讨论的最终设计是一致的。真正需要继续重点检查的就不是“RLPD 是否缺关键逻辑”，而是：
+
+1. ✅config 里的 process_demos 是否还过滤零动作，
+   #########应该过滤，
+   #########目前我的demos完整保留操作轨迹，不过滤静止帧，
+   #####现在的录制脚本已经解决了 reset/等待帧问题：它明确要求“第一次 VR 接管后才开始记录”，而且说明“全程轨迹完整保留，不删除演示开始后的静止帧”。开始记录后，如果某帧没有接管，它会保存零动作 zero_after_recording_started，再写入 trajectory。
+   ####所以录制demos时，vr暂停，会把无vr接管时的动作级成零增量的静止帧，后续learner应该去掉这个静止帧。
+   #########只要保证demos时，不是帧的需要静止帧，即可以删去。
+   ###########1e-4 是几乎全静止阈值。
+       过滤它可以减少无意义零动作帧，
+          但不能无脑过滤全部静止帧。
+           你应该至少保留 reward=1 和 done=True 的静止帧，
+                否则可能删掉最关键的成功终止数据。
+                
+2. ✅ wrapper 里的 grasp_penalty 是否只写 info、不改 reward  
+3. ✅ env.step 内部是否正确把 -1/0/+1 夹爪标签映射到硬件 10/保持/80
+4. ✅ （抓镊子后保持量程20,算闭合）CLOSE_MAX=30 / OPEN_MIN=70 是否适合真实夹持反馈

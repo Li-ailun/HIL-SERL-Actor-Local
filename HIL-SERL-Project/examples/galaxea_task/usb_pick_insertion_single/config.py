@@ -359,7 +359,9 @@ class GalaxeaUSBTrainConfig(DefaultTrainingConfig):
         return env
 
     # ==============================
-    # 11. demo 清洗
+    # 11. learner对demo 的初步清洗（可以过滤静止帧，但是不要把最后一帧成功帧当作静止帧过滤掉）
+                   ####目前逻辑是过滤所有静止帧，可能把最后的成功帧过滤掉
+                   ####目前rlpd没有导入这个功能
     # ==============================
     def process_demos(self, transitions):
         processed = []

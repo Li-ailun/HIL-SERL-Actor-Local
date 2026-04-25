@@ -290,6 +290,8 @@ class SingleGripperPenaltyWrapper(gym.Wrapper):
           cmd=0 是 hold 标签，不是夹爪硬件量程 0。
           硬件量程 10/80 只应该出现在最终 ROS 执行映射层。
         """
+
+        ###不再通过夹爪量程进行二次确认了，直接从标签判断状态
         cmd = float(cmd)
 
         if cmd < self.close_thr:
@@ -301,37 +303,7 @@ class SingleGripperPenaltyWrapper(gym.Wrapper):
 
 
 
-    # def _canonicalize_action_cmd(self, cmd: float) -> float:
-    #     """
-    #     把 action[6] 统一转换成夹爪事件标签：
-    #       -1 = close event
-    #        0 = hold / no-op
-    #       +1 = open event
 
-    #     关键点：
-    #       必须先判断三值空间，否则 0 会被误判成硬件 close。
-    #     """
-    #     cmd = float(cmd)
-
-    #     # 1) 先处理三值/策略空间：-1 / 0 / +1
-    #     #    这样 0 会正确保留为 hold。
-    #     if -1.5 <= cmd <= 1.5:
-    #         if cmd < self.close_thr:
-    #             return -1.0
-    #         if cmd > self.open_thr:
-    #             return 1.0
-    #         return 0.0
-
-    #     # 2) 再处理 Galaxea 硬件量程命令，例如 10 / 80
-    #     if 0.0 <= cmd <= self.hw_close_max:
-    #         return -1.0
-
-    #     if self.hw_open_min <= cmd <= 100.0:
-    #         return 1.0
-
-    #     # 3) 其他中间硬件值，视为 hold / unclear。
-    #     #    注意：这不是让夹爪运动到中间值，只是不触发 penalty。
-    #     return 0.0
 
     def _compute_penalty(self, cmd_label, prev_closed):
         """
