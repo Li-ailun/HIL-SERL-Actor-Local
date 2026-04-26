@@ -430,7 +430,10 @@ demos 和 RLPD 的夹爪保存定义是统一的。
 ###########################知识十五（wandb）
 
 learner端支持wandb，先登陆：
-（1）wandb 
+（1）wandb ：
+wandb status
+wandb login --verify
+wandb online
 （2）输入key：loginwandb_v1_8Uf8krEtedBNwL62O6QBNeaBoRK_miAJZd1wqF00VrFsvbfxKCcOXUITWtOVeOUvkFIPAR40sWZnT
 （3）输入指令：
 python train_rlpd.py   --exp_name=galaxea_usb_insertion_single   --learner=True   --ip=localhost   --demo_path=./demo_data_single   --checkpoint_path=./rlpd_checkpoints_single   --debug=False
@@ -515,3 +518,73 @@ config 的相机分工也合理：ENV_IMAGE_KEYS 打开三路，image_keys=["hea
 6. RLPD 中 online 数据和 demo 数据比例、训练 loss、grasp_critic loss 是否正常
 
 一句话：现在整体框架我认为已经没有明显结构性问题了，剩下主要就是训练效果、数据质量、阈值和超参数的细节优化。
+
+
+
+###
+###
+###
+
+
+#######################知识十六（vr的归一化）
+
+之前的归一化测试脚本，主要测试的是：
+
+policy/VR action[:6] ∈ [-1, 1]
+经过 env 内部 POS_SCALE / ROT_SCALE
+最终机器人末端实际走多少
+
+现在这个问题是更上游的：
+你的 VRInterventionWrapper 当前把 VR 手柄的绝对位置/角度直接拼成 action，所以会出现 1.58 这种超过 [-1,1] 的值。你需要在 VR wrapper 源头加一层：
+
+VR 当前手柄位姿 - 进入 VR 接管瞬间的手柄位姿
+再除以 vr_pos_range / vr_rot_range
+最后 clip 到 [-1,1]
+
+也就是：先把 VR 输入归一化成 policy 动作空间，再交给 env.step。
+
+
+所以我需要调试任务适配的vr动作缩放，当demos脚本不报错超限，则动作缩放适配当前任务
+
+
+
+###
+###
+###
+
+##########################最新输出(2026.4.26)
+
+
+（1）rlpd的actor的buffer和demobuffer：
+唯一建议：注意早期几条接近饱和的动作
+
+虽然没有越界，但普通 buffer 里有几条动作很接近边界，例如 idx=121、idx=134、idx=711 这几条。它们的前 6 维有接近 ±1.0 的值。
+
+这不影响数据合法性，但后续训练时你可以留意两点：
+
+1. 如果只是少量探索/人工接管动作接近 1，可以接受。
+2. 如果 wandb 或后续 inspect 发现大量动作长期接近 ±1，说明策略或 VR 接管动作可能过猛，需要调小动作尺度或改善策略稳定性。
+
+目前从总体统计看，它不是格式 bug，也不是必须立刻改代码的问题。
+
+最终结论
+
+这份最新 RLPD buffer 检查结果可以通过。
+
+普通 buffer 和 demo_buffer 都已经满足正式训练数据要求：
+
+✅ reward / done / mask 正确
+✅ 成功 transition 保存正确
+✅ action shape 全部为 7
+✅ 前 6 维动作没有越界
+✅ gripper 是 -1/0/+1 事件标签
+✅ grasp_penalty 与最终 action[6] 完全对齐
+✅ close/open 才有 penalty
+✅ hold 没有 penalty
+✅ 图像选择符合 head_rgb + right_wrist_rgb + state
+
+一句话：RLPD actor 在线保存 buffer 的核心数据链路已经正确，剩下主要关注训练效果和动作是否过于激进。
+
+（2）demos全部正常
+
+（3）wandb的训练日志（运行9min的）：

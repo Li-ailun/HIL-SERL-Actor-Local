@@ -126,8 +126,8 @@ class GalaxeaUSBEnvConfig:
     # ==============================
     RESET_POSE = np.array(
         [
-            0.2,
-            -0.3,
+            0.21,
+            -0.32,
             -0.15,
             0.0,
             0.0,
@@ -151,7 +151,7 @@ class GalaxeaUSBEnvConfig:
     # ==============================
     HZ = 15
     DISPLAY_IMAGES = True
-    MAX_EPISODE_LENGTH = 250
+    MAX_EPISODE_LENGTH = 400
 
     # ==============================
     # 3. 图像 / 显示配置
@@ -191,7 +191,7 @@ class GalaxeaUSBEnvConfig:
     }
 
     HEAD_CAMERA = {
-        "device_index": 6,   # 用 v4l2-ctl --list-devices 查询
+        "device_index": 8,   # 用 v4l2-ctl --list-devices 查询
         "api": cv2.CAP_V4L2,
         "fourcc": "MJPG",
         "frame_width": 1344,

@@ -82,7 +82,7 @@ flags.DEFINE_string(
 
 flags.DEFINE_integer(
     "successes_needed",
-    5,
+    20,
     "Number of successful demos to collect.",
 )
 
@@ -130,6 +130,15 @@ flags.DEFINE_boolean(
     "demo_strict_obs_keys",
     True,
     "If True, raise error when requested demo image/state key is missing.",
+)
+
+flags.DEFINE_float(
+    "grasp_penalty_value",
+    -0.02,
+    (
+        "Grasp penalty written into demos after action[6] has been rewritten to "
+        "-1/0/+1 event labels. This value should match the learned-gripper penalty."
+    ),
 )
 
 
@@ -197,6 +206,16 @@ def ask_success_from_terminal():
             print("❌ 请输入 1 或 0。")
         except ValueError:
             print("❌ 输入无效，请输入 1 或 0。")
+
+
+def scalar_float(x, default=0.0):
+    try:
+        arr = np.asarray(x).reshape(-1)
+        if arr.size == 0:
+            return float(default)
+        return float(arr[0])
+    except Exception:
+        return float(default)
 
 
 # ==============================================================
@@ -500,6 +519,103 @@ def rewrite_gripper_action_to_official_style(
     return action.astype(np.float32), next_state
 
 
+# ==============================================================
+# grasp_penalty 同步逻辑
+# --------------------------------------------------------------
+# 关键修改：
+# env.step() 内部的 SingleGripperPenaltyWrapper 可能在 action[6]
+# 被重写成三值事件之前就计算了 info["grasp_penalty"]。
+#
+# 因此最终保存 demos 前，必须按“最终保存的 action[6]”
+# 重新计算 grasp_penalty，保证：
+#   hold(0)       -> 0
+#   close(-1)    -> FLAGS.grasp_penalty_value
+#   open(+1)     -> FLAGS.grasp_penalty_value
+#
+# 这样不会再出现：
+#   action[6] = hold(0)
+#   grasp_penalty = -0.02
+# 的错误组合。
+# ==============================================================
+
+def recompute_grasp_penalty_from_stored_action(action, penalty_value):
+    """
+    根据最终保存的 action[6] 三值事件标签重算 grasp_penalty。
+
+    action[6]:
+      -1 = close event -> penalty_value
+       0 = hold        -> 0
+      +1 = open event  -> penalty_value
+    """
+    a = np.asarray(action, dtype=np.float32).reshape(-1)
+
+    if a.shape[0] != 7:
+        return 0.0
+
+    g = float(a[6])
+
+    if g <= -0.5:
+        return float(penalty_value)
+
+    if g >= 0.5:
+        return float(penalty_value)
+
+    return 0.0
+
+
+def sync_grasp_penalty_with_stored_action(trans, penalty_value):
+    """
+    将 grasp_penalty 与最终保存的 action[6] 三值事件标签同步。
+
+    保存策略：
+      1. trans["grasp_penalty"] 写入重算后的 penalty，方便 RLPD 直接读取。
+      2. trans["infos"]["grasp_penalty"] 也写入重算后的 penalty，方便可视化脚本读取。
+      3. 如果 env 原始 info 里已经有 grasp_penalty，则保留为 env_grasp_penalty_raw，方便调试。
+    """
+    trans = copy.deepcopy(trans)
+
+    if "actions" not in trans:
+        return trans
+
+    expected_penalty = recompute_grasp_penalty_from_stored_action(
+        trans["actions"],
+        penalty_value=penalty_value,
+    )
+
+    infos = trans.get("infos", {})
+    if not isinstance(infos, dict):
+        infos = {}
+
+    if "grasp_penalty" in infos:
+        infos["env_grasp_penalty_raw"] = scalar_float(infos["grasp_penalty"], 0.0)
+
+    if "grasp_penalty" in trans:
+        infos["top_level_grasp_penalty_raw"] = scalar_float(trans["grasp_penalty"], 0.0)
+
+    infos["grasp_penalty"] = float(expected_penalty)
+    infos["grasp_penalty_source"] = "recomputed_from_final_stored_action"
+
+    trans["infos"] = infos
+    trans["grasp_penalty"] = float(expected_penalty)
+
+    return trans
+
+
+def extract_saved_grasp_penalty(trans):
+    if "grasp_penalty" in trans:
+        return scalar_float(trans["grasp_penalty"], 0.0)
+
+    infos = trans.get("infos", {})
+    if isinstance(infos, dict) and "grasp_penalty" in infos:
+        return scalar_float(infos["grasp_penalty"], 0.0)
+
+    return None
+
+
+# ==============================================================
+# 其他辅助
+# ==============================================================
+
 def build_safe_idle_action(action_shape):
     """
     默认发给机器人的“安全空动作”：
@@ -534,9 +650,22 @@ def print_trajectory_action_stats(trajectory):
     n_open = int(np.sum(g > 0.5))
     n_hold = int(np.sum(np.abs(g) <= 0.5))
 
+    penalties = []
+    for t in trajectory:
+        p = extract_saved_grasp_penalty(t)
+        if p is not None:
+            penalties.append(float(p))
+
     print(f"📦 本条完整轨迹长度: {len(trajectory)}")
     print(f"🦾 arm action min={arm_min:.4f}, max={arm_max:.4f}, absmax={arm_absmax:.4f}")
     print(f"🤏 gripper统计: close={n_close}, hold={n_hold}, open={n_open}")
+
+    if penalties:
+        penalties_np = np.asarray(penalties, dtype=np.float32)
+        nonzero = int(np.sum(np.abs(penalties_np) > 1e-8))
+        vals, cnts = np.unique(np.round(penalties_np, 8), return_counts=True)
+        dist = {float(v): int(c) for v, c in zip(vals, cnts)}
+        print(f"🧲 grasp_penalty统计: nonzero={nonzero}, sum={float(np.sum(penalties_np)):.6f}, dist={dist}")
 
     if arm_absmax > 1.0001:
         print("❌ 警告：本条轨迹仍有 action[:6] 超出 [-1,1]，请立刻停止并检查。")
@@ -552,9 +681,17 @@ def finalize_transition_for_demo_storage(
     """
     最终保存前统一处理：
     1. action 清洗
-    2. obs / next_obs 按 demo_image_keys 裁剪
+    2. grasp_penalty 按最终 action[6] 重算
+    3. obs / next_obs 按 demo_image_keys 裁剪
     """
     trans = sanitize_transition_for_storage(trans)
+
+    # 关键：必须在 action 已经是最终保存格式之后重算 penalty。
+    trans = sync_grasp_penalty_with_stored_action(
+        trans,
+        penalty_value=FLAGS.grasp_penalty_value,
+    )
+
     trans = prune_transition_obs_for_demo_storage(
         trans,
         image_keys=demo_image_keys,
@@ -582,6 +719,7 @@ def main(_):
     print("   - 保存到 pkl 的 action 会强制统一格式：")
     print("       action[:6] -> clip 到 [-1,1]")
     print("       action[6]  -> -1 / 0 / +1 三值事件")
+    print("   - grasp_penalty 会按最终保存的 action[6] 重新计算，避免 hold 被错误处罚。")
     print("   - demos 保存的图像不直接等于 ENV_IMAGE_KEYS，而是按 image_keys 裁剪。")
     print()
     print("===== 当前相机/观测保存配置 =====")
@@ -591,6 +729,7 @@ def main(_):
     print(f"demo_image_keys                = {demo_image_keys if demo_image_keys is not None else 'all'}")
     print(f"demo_extra_obs_keys            = {demo_extra_obs_keys}")
     print(f"demo_strict_obs_keys           = {FLAGS.demo_strict_obs_keys}")
+    print(f"grasp_penalty_value            = {FLAGS.grasp_penalty_value}")
     print("================================\n")
 
     env = env_config.get_environment(
@@ -781,6 +920,13 @@ def main(_):
                     trajectory[-1]["masks"] = 0.0
                     trajectory[-1]["rewards"] = float(succeed)
 
+                    # 重新 finalize 一次，防止上面 copy.deepcopy(info) 把旧 grasp_penalty 覆盖回来。
+                    trajectory[-1] = finalize_transition_for_demo_storage(
+                        trajectory[-1],
+                        demo_image_keys=demo_image_keys,
+                        demo_extra_obs_keys=demo_extra_obs_keys,
+                    )
+
             else:
                 print("📝 当前 classifier=False，使用人工判定 success / fail。")
                 succeed = ask_success_from_terminal()
@@ -793,6 +939,13 @@ def main(_):
                     trajectory[-1]["rewards"] = float(succeed)
                     trajectory[-1]["dones"] = True
                     trajectory[-1]["masks"] = 0.0
+
+                    # 重新 finalize 一次，防止上面 copy.deepcopy(info) 把旧 grasp_penalty 覆盖回来。
+                    trajectory[-1] = finalize_transition_for_demo_storage(
+                        trajectory[-1],
+                        demo_image_keys=demo_image_keys,
+                        demo_extra_obs_keys=demo_extra_obs_keys,
+                    )
 
             if succeed and len(trajectory) > 0:
                 clean_trajectory = []
@@ -875,6 +1028,32 @@ def main(_):
             },
         )
 
+        all_penalties = []
+        for t in transitions:
+            p = extract_saved_grasp_penalty(t)
+            if p is not None:
+                all_penalties.append(float(p))
+
+        if all_penalties:
+            all_penalties = np.asarray(all_penalties, dtype=np.float32)
+            vals, cnts = np.unique(np.round(all_penalties, 8), return_counts=True)
+            dist = {float(v): int(c) for v, c in zip(vals, cnts)}
+            print("\n===== 最终保存 grasp_penalty 检查 =====")
+            print(f"grasp_penalty shape: {all_penalties.shape}")
+            print(f"grasp_penalty 分布: {dist}")
+            print(f"grasp_penalty 非零数量: {int(np.sum(np.abs(all_penalties) > 1e-8))}")
+            print(f"grasp_penalty sum: {float(np.sum(all_penalties)):.6f}")
+
+            expected_nonzero = int(np.sum(np.abs(g) > 0.5))
+            actual_nonzero = int(np.sum(np.abs(all_penalties) > 1e-8))
+            print(f"按 gripper 事件预期非零 penalty 数量: {expected_nonzero}")
+            print(f"实际非零 penalty 数量: {actual_nonzero}")
+
+            if expected_nonzero != actual_nonzero:
+                print("⚠️ grasp_penalty 非零数量和 gripper open/close 事件数量不一致，请检查。")
+            else:
+                print("✅ grasp_penalty 已与最终 gripper 三值事件对齐。")
+
         if float(np.max(np.abs(all_actions[:, :6]))) > 1.0001:
             print("❌ 保存后的 action 仍然超界，请不要用于训练。")
         else:
@@ -883,7 +1062,6 @@ def main(_):
 
 if __name__ == "__main__":
     app.run(main)
-
 
 
 

@@ -19,14 +19,13 @@
 # python inspect_demo_pkl.py --image_keys head_rgb right_wrist_rgb
 
 
-#!/usr/bin/env python3
 import os
 import re
 import glob
 import argparse
 import pickle as pkl
 from collections import Counter, defaultdict
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -379,7 +378,328 @@ def get_mask(trans: Dict[str, Any]):
     return safe_float(trans.get("masks", trans.get("mask", 1.0)))
 
 
-def summarize_transitions(transitions: List[Dict[str, Any]], image_keys: List[str], sample_count: int = 5):
+def extract_grasp_penalty(trans: Dict[str, Any]):
+    """
+    读取当前训练实际会用到的 grasp_penalty。
+
+    优先级：
+    1. trans["grasp_penalty"]，新 demo / RLPD buffer 推荐顶层保存
+    2. trans["infos"]["grasp_penalty"]，旧 demo 通常在 infos 里
+
+    返回:
+      (penalty_float, source_string)
+      如果没有找到，返回 (None, None)
+    """
+    if not isinstance(trans, dict):
+        return None, None
+
+    if "grasp_penalty" in trans:
+        return safe_float(trans["grasp_penalty"]), "top_level"
+
+    infos = trans.get("infos", trans.get("info", None))
+    if isinstance(infos, dict) and "grasp_penalty" in infos:
+        return safe_float(infos["grasp_penalty"]), "infos"
+
+    return None, None
+
+
+def extract_all_grasp_penalty_fields(trans: Dict[str, Any]):
+    """
+    同时读取所有可能存在的 penalty 字段，便于排查：
+    - top_level grasp_penalty
+    - infos grasp_penalty
+    - infos env_grasp_penalty_raw
+    - infos top_level_grasp_penalty_raw
+    """
+    out = {}
+
+    if not isinstance(trans, dict):
+        return out
+
+    if "grasp_penalty" in trans:
+        out["top_level.grasp_penalty"] = safe_float(trans["grasp_penalty"])
+
+    infos = trans.get("infos", trans.get("info", None))
+    if isinstance(infos, dict):
+        for key in [
+            "grasp_penalty",
+            "env_grasp_penalty_raw",
+            "top_level_grasp_penalty_raw",
+            "grasp_penalty_source",
+        ]:
+            if key in infos:
+                out[f"infos.{key}"] = infos[key]
+
+    return out
+
+
+def expected_grasp_penalty_from_action(action: Any, penalty_value: float = -0.02) -> float:
+    """
+    根据最终保存的 action[6] 三值事件标签重算期望 grasp_penalty。
+
+    当前设计：
+      action[6] = -1 close event -> penalty_value
+      action[6] =  0 hold        -> 0
+      action[6] = +1 open event  -> penalty_value
+
+    这个函数用于检查 demos / buffer 里保存的 grasp_penalty 是否和最终 action[6] 对齐。
+    """
+    a = flatten_action(action)
+    if a is None or a.shape[0] != 7:
+        return 0.0
+
+    g = float(a[6])
+    if g <= -0.5:
+        return float(penalty_value)
+    if g >= 0.5:
+        return float(penalty_value)
+    return 0.0
+
+
+def print_grasp_penalty_stats(
+    transitions: List[Dict[str, Any]],
+    expected_penalty_value: float = -0.02,
+    mismatch_tol: float = 1e-6,
+):
+    """
+    统计 grasp_penalty，并和根据最终 action[6] 重算的 expected_grasp_penalty 对比。
+
+    重点检查：
+    - 当前保存的 penalty 分布
+    - 根据 action[6] 应该得到的 penalty 分布
+    - stored 与 expected 是否一致
+    - 非零 penalty 是否落在 close/open 上，而不是 hold 上
+    """
+    print("\n" + "=" * 100)
+    print("grasp_penalty 检查")
+    print("=" * 100)
+
+    stored_penalties = []
+    stored_sources = []
+    expected_penalties = []
+
+    nonzero_stored_indices = []
+    nonzero_expected_indices = []
+    mismatch_indices = []
+    missing_count = 0
+
+    top_level_count = 0
+    infos_count = 0
+    both_count = 0
+    top_info_mismatch = []
+
+    raw_env_penalties = []
+    raw_env_indices = []
+
+    for i, trans in enumerate(transitions):
+        stored, source = extract_grasp_penalty(trans)
+        expected = expected_grasp_penalty_from_action(
+            trans.get("actions"),
+            penalty_value=expected_penalty_value,
+        )
+
+        expected_penalties.append(float(expected))
+
+        fields = extract_all_grasp_penalty_fields(trans)
+        has_top = "top_level.grasp_penalty" in fields
+        has_info = "infos.grasp_penalty" in fields
+
+        if has_top:
+            top_level_count += 1
+        if has_info:
+            infos_count += 1
+        if has_top and has_info:
+            both_count += 1
+            top_v = safe_float(fields["top_level.grasp_penalty"])
+            info_v = safe_float(fields["infos.grasp_penalty"])
+            if abs(top_v - info_v) > mismatch_tol:
+                top_info_mismatch.append(i)
+
+        if "infos.env_grasp_penalty_raw" in fields:
+            raw_env_penalties.append(safe_float(fields["infos.env_grasp_penalty_raw"]))
+            raw_env_indices.append(i)
+
+        if stored is None:
+            missing_count += 1
+            stored_penalties.append(np.nan)
+            stored_sources.append("missing")
+            continue
+
+        stored = float(stored)
+        stored_penalties.append(stored)
+        stored_sources.append(source)
+
+        if abs(stored) > 1e-8:
+            nonzero_stored_indices.append(i)
+
+        if abs(float(expected)) > 1e-8:
+            nonzero_expected_indices.append(i)
+
+        if abs(stored - expected) > mismatch_tol:
+            mismatch_indices.append(i)
+
+    if len(transitions) == 0:
+        print("文件为空，无法检查 grasp_penalty。")
+        return
+
+    expected_np = np.asarray(expected_penalties, dtype=np.float32)
+    stored_np = np.asarray(stored_penalties, dtype=np.float32)
+
+    valid_stored_mask = ~np.isnan(stored_np)
+    valid_stored = stored_np[valid_stored_mask]
+
+    expected_vals, expected_counts = np.unique(np.round(expected_np, 8), return_counts=True)
+    expected_dist = {float(v): int(c) for v, c in zip(expected_vals, expected_counts)}
+
+    print(f"expected_penalty_value         : {expected_penalty_value}")
+    print(f"transition 总数                : {len(transitions)}")
+    print(f"grasp_penalty 缺失数量          : {missing_count}")
+    print(f"top_level grasp_penalty 数量    : {top_level_count}")
+    print(f"infos grasp_penalty 数量        : {infos_count}")
+    print(f"top_level + infos 同时存在数量  : {both_count}")
+    print(f"top_level 与 infos 不一致数量   : {len(top_info_mismatch)}")
+
+    if len(valid_stored) == 0:
+        print("\n❌ 没有找到任何可用 grasp_penalty 字段。")
+        print("   当前 pkl 里既没有 trans['grasp_penalty']，也没有 trans['infos']['grasp_penalty']。")
+        print("   但下面仍会显示 expected_grasp_penalty，用于判断按 action[6] 应该有几个 penalty。")
+    else:
+        unique_vals, counts = np.unique(np.round(valid_stored, 8), return_counts=True)
+        stored_dist = {float(v): int(c) for v, c in zip(unique_vals, counts)}
+        source_dist = dict(Counter(stored_sources))
+
+        print(f"\nstored grasp_penalty 来源分布    : {source_dist}")
+        print(f"stored grasp_penalty 取值分布    : {stored_dist}")
+        print(f"stored grasp_penalty 非零数量    : {len(nonzero_stored_indices)}")
+        print(f"stored grasp_penalty min         : {float(np.min(valid_stored)):.6f}")
+        print(f"stored grasp_penalty max         : {float(np.max(valid_stored)):.6f}")
+        print(f"stored grasp_penalty mean        : {float(np.mean(valid_stored)):.6f}")
+        print(f"stored grasp_penalty sum         : {float(np.sum(valid_stored)):.6f}")
+
+    print(f"\nexpected grasp_penalty 取值分布  : {expected_dist}")
+    print(f"expected grasp_penalty 非零数量  : {len(nonzero_expected_indices)}")
+    print(f"expected grasp_penalty sum       : {float(np.sum(expected_np)):.6f}")
+
+    if raw_env_penalties:
+        raw_np = np.asarray(raw_env_penalties, dtype=np.float32)
+        vals, cnts = np.unique(np.round(raw_np, 8), return_counts=True)
+        raw_dist = {float(v): int(c) for v, c in zip(vals, cnts)}
+        print(f"\nraw env_grasp_penalty_raw 数量   : {len(raw_env_penalties)}")
+        print(f"raw env_grasp_penalty_raw 分布   : {raw_dist}")
+        print(f"raw env_grasp_penalty_raw sum    : {float(np.sum(raw_np)):.6f}")
+
+    # 和 gripper action 做对应统计
+    gripper_all = Counter()
+    gripper_with_stored_penalty = Counter()
+    gripper_with_expected_penalty = Counter()
+    gripper_with_mismatch = Counter()
+
+    for i, trans in enumerate(transitions):
+        g_desc = classify_gripper_from_action(trans.get("actions"))
+        gripper_all[g_desc] += 1
+
+        stored, _ = extract_grasp_penalty(trans)
+        expected = expected_penalties[i]
+
+        if stored is not None and abs(float(stored)) > 1e-8:
+            gripper_with_stored_penalty[g_desc] += 1
+
+        if abs(float(expected)) > 1e-8:
+            gripper_with_expected_penalty[g_desc] += 1
+
+        if i in mismatch_indices:
+            gripper_with_mismatch[g_desc] += 1
+
+    print(f"\ngripper 全部分布                 : {dict(gripper_all)}")
+    print(f"非零 stored penalty 对应 gripper : {dict(gripper_with_stored_penalty)}")
+    print(f"非零 expected penalty 对应 gripper: {dict(gripper_with_expected_penalty)}")
+    print(f"stored vs expected mismatch 数量 : {len(mismatch_indices)}")
+    print(f"mismatch 对应 gripper 分布        : {dict(gripper_with_mismatch)}")
+
+    # 给出直接判断
+    print("\n判断：")
+    if len(valid_stored) == 0:
+        if len(nonzero_expected_indices) > 0:
+            print("⚠️ 当前文件没有 stored grasp_penalty，但按 action[6] 应该存在非零 penalty。")
+        else:
+            print("ℹ️ 当前文件没有 stored grasp_penalty，且按 action[6] 也没有非零 penalty。")
+    elif len(mismatch_indices) == 0:
+        print("✅ stored grasp_penalty 与 expected_grasp_penalty 完全对齐。")
+        print("✅ penalty 已经跟最终保存的 action[6] 三值事件一致。")
+    else:
+        print("❌ stored grasp_penalty 与 expected_grasp_penalty 不一致。")
+        print("   这通常说明 env.step 里提前算出的 info['grasp_penalty'] 没有在 action[6] 重写后同步重算。")
+        print("   正确目标：hold(0)->0，close/open 事件->-0.02。")
+
+    if gripper_with_stored_penalty.get("hold(0)", 0) > 0:
+        print("❌ 检测到 stored penalty 落在 hold(0) 上。")
+        print("   如果你的设计是事件惩罚，这说明当前 pkl 里的 grasp_penalty 仍是旧逻辑或未同步。")
+
+    if len(nonzero_expected_indices) > 0 and len(nonzero_stored_indices) == len(nonzero_expected_indices) and len(mismatch_indices) == 0:
+        print("✅ 非零 penalty 数量与 gripper close/open 事件数量一致。")
+
+    if len(top_info_mismatch) > 0:
+        print("\n⚠️ top_level grasp_penalty 和 infos.grasp_penalty 存在不一致。前若干 index:")
+        print(top_info_mismatch[:30])
+
+    if len(nonzero_stored_indices) > 0:
+        print("\n前若干非零 stored grasp_penalty transition:")
+        for idx in nonzero_stored_indices[:30]:
+            trans = transitions[idx]
+            stored, source = extract_grasp_penalty(trans)
+            expected = expected_penalties[idx]
+            action = flatten_action(trans.get("actions"))
+            fields = extract_all_grasp_penalty_fields(trans)
+
+            print(
+                f"  idx={idx}, stored={stored}, expected={expected}, source={source}, "
+                f"gripper={classify_gripper_from_action(trans.get('actions'))}, "
+                f"reward={get_reward(trans)}, done={get_done(trans)}, mask={get_mask(trans)}, "
+                f"action={np.round(action, 4).tolist() if action is not None else None}, "
+                f"fields={fields}"
+            )
+
+    if len(nonzero_expected_indices) > 0:
+        print("\n前若干 expected 非零 grasp_penalty transition:")
+        for idx in nonzero_expected_indices[:30]:
+            trans = transitions[idx]
+            stored, source = extract_grasp_penalty(trans)
+            expected = expected_penalties[idx]
+            action = flatten_action(trans.get("actions"))
+            fields = extract_all_grasp_penalty_fields(trans)
+
+            print(
+                f"  idx={idx}, stored={stored}, expected={expected}, source={source}, "
+                f"gripper={classify_gripper_from_action(trans.get('actions'))}, "
+                f"reward={get_reward(trans)}, done={get_done(trans)}, mask={get_mask(trans)}, "
+                f"action={np.round(action, 4).tolist() if action is not None else None}, "
+                f"fields={fields}"
+            )
+
+    if len(mismatch_indices) > 0:
+        print("\n前若干 stored vs expected 不一致 transition:")
+        for idx in mismatch_indices[:40]:
+            trans = transitions[idx]
+            stored, source = extract_grasp_penalty(trans)
+            expected = expected_penalties[idx]
+            action = flatten_action(trans.get("actions"))
+            fields = extract_all_grasp_penalty_fields(trans)
+
+            print(
+                f"  idx={idx}, stored={stored}, expected={expected}, source={source}, "
+                f"gripper={classify_gripper_from_action(trans.get('actions'))}, "
+                f"reward={get_reward(trans)}, done={get_done(trans)}, mask={get_mask(trans)}, "
+                f"action={np.round(action, 4).tolist() if action is not None else None}, "
+                f"fields={fields}"
+            )
+
+
+def summarize_transitions(
+    transitions: List[Dict[str, Any]],
+    image_keys: List[str],
+    sample_count: int = 5,
+    expected_grasp_penalty: float = -0.02,
+):
     n = len(transitions)
 
     print("\n" + "=" * 100)
@@ -634,6 +954,14 @@ def summarize_transitions(transitions: List[Dict[str, Any]], image_keys: List[st
     else:
         print(infos)
 
+    # ----------------------------------------
+    # grasp_penalty
+    # ----------------------------------------
+    print_grasp_penalty_stats(
+        transitions,
+        expected_penalty_value=expected_grasp_penalty,
+    )
+
 
 # ============================================================
 # 可选保存图片预览
@@ -645,6 +973,7 @@ def save_image_previews(
     out_dir: str,
     indices: Optional[List[int]] = None,
     max_count: int = 10,
+    expected_grasp_penalty: float = -0.02,
 ):
     try:
         import cv2
@@ -685,7 +1014,6 @@ def save_image_previews(
         obs = get_obs_dict(trans, "observations")
 
         imgs = []
-        captions = []
 
         for k in image_keys:
             img = get_image_from_obs(obs, k)
@@ -707,7 +1035,6 @@ def save_image_previews(
                 save_arr = arr
 
             imgs.append(save_arr)
-            captions.append(k)
 
         if not imgs:
             continue
@@ -722,9 +1049,19 @@ def save_image_previews(
 
         canvas = np.concatenate(resized, axis=1)
 
+        stored_penalty, _ = extract_grasp_penalty(trans)
+        expected_penalty = expected_grasp_penalty_from_action(
+            trans.get("actions"),
+            penalty_value=expected_grasp_penalty,
+        )
+
+        stored_text = "None" if stored_penalty is None else f"{stored_penalty:.4f}"
+        expected_text = f"{expected_penalty:.4f}"
+
         text = (
             f"idx={idx} reward={get_reward(trans)} done={get_done(trans)} "
-            f"mask={get_mask(trans)} gripper={classify_gripper_from_action(trans.get('actions'))}"
+            f"mask={get_mask(trans)} gripper={classify_gripper_from_action(trans.get('actions'))} "
+            f"stored_gp={stored_text} expected_gp={expected_text}"
         )
 
         # 加一条文字区域
@@ -789,6 +1126,13 @@ def main():
     )
 
     parser.add_argument(
+        "--expected_grasp_penalty",
+        type=float,
+        default=-0.02,
+        help="根据最终 action[6] 重算 expected grasp_penalty 时使用的 penalty 值。",
+    )
+
+    parser.add_argument(
         "--save_preview",
         action="store_true",
         help="是否保存若干帧图像预览。",
@@ -818,6 +1162,7 @@ def main():
     print("=" * 100)
     print(f"demo dir : {directory}")
     print(f"pkl path : {path}")
+    print(f"expected_grasp_penalty: {args.expected_grasp_penalty}")
 
     obj = load_pickle(path)
     transitions = normalize_loaded_object(obj)
@@ -826,6 +1171,7 @@ def main():
         transitions,
         image_keys=args.image_keys,
         sample_count=args.sample_count,
+        expected_grasp_penalty=args.expected_grasp_penalty,
     )
 
     if args.save_preview:
@@ -839,17 +1185,21 @@ def main():
             out_dir=os.path.abspath(preview_dir),
             indices=None,
             max_count=args.preview_count,
+            expected_grasp_penalty=args.expected_grasp_penalty,
         )
 
     print("\n" + "=" * 100)
     print("结论提示")
     print("=" * 100)
-    print("1. 单臂任务通常应看到 action shape=(7,)，state 最后一维=8。")
+    print("1. 单臂任务通常应看到 action shape=(7)，state 最后一维=8。")
     print("2. 如果 demos 用于当前 RLPD，demo 里至少要包含当前 image_keys 需要的相机。")
     print("3. 如果 action 前 6 维超过 [-1,1]，说明动作归一化/clip 有问题。")
     print("4. 如果 gripper 不是 -1/0/+1 三值，说明夹爪标签和当前训练定义不一致。")
     print("5. 如果 reward=1 的 transition 同时 done=True 且 mask=0，说明成功终止数据正常。")
     print("6. 如果图像 shape 都是 (1,128,128,3)，说明和当前 SERLObsWrapper / 视觉输入基本匹配。")
+    print("7. expected_grasp_penalty 是根据最终保存的 action[6] 重算的正确参考值。")
+    print("8. 如果 stored penalty 落在 hold(0) 上，说明 pkl 里的 grasp_penalty 没有和最终 action[6] 同步。")
+    print("9. 新版 record_demos.py 应该看到 stored 与 expected 完全一致。")
 
 
 if __name__ == "__main__":
