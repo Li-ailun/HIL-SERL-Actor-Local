@@ -6,13 +6,13 @@
   "num_epochs": 150,
   "batch_size": 256,
   "success_files": [
-    "/home/eren/HIL-SERL/HIL-SERL-Project/examples/classifier_data_single/galaxea_usb_insertion_single_200_success_images_left_wrist_rgb_2026-04-24_16-55-58.pkl"
+    "/home/eren/HIL-SERL/HIL-SERL-Project/examples/classifier_data_single/galaxea_usb_insertion_single_200_success_images_left_wrist_rgb_2026-04-28_16-51-35.pkl"
   ],
   "failure_files": [
-    "/home/eren/HIL-SERL/HIL-SERL-Project/examples/classifier_data_single/galaxea_usb_insertion_single_2348_failure_images_left_wrist_rgb_2026-04-24_16-55-58.pkl"
+    "/home/eren/HIL-SERL/HIL-SERL-Project/examples/classifier_data_single/galaxea_usb_insertion_single_1325_failure_images_left_wrist_rgb_2026-04-28_16-51-35.pkl"
   ],
   "success_inserted": 200,
-  "failure_inserted": 2348,
+  "failure_inserted": 1325,
   "success_skipped": 0,
   "failure_skipped": 0
 }

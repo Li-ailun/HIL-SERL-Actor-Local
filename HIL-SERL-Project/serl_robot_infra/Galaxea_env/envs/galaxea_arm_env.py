@@ -117,6 +117,27 @@ class GalaxeaArmEnv(gym.Env):
         self.rot_scale = float(self._require_config_attr("ROT_SCALE"))
 
         # ==========================================================
+        # 2.1 step 等待 / 状态同步配置
+        # ----------------------------------------------------------
+        # 借鉴官方 FrankaEnv 的思想：
+        # - actor / replay 外层只调用 env.step(action)
+        # - env.step 内部负责发布动作、按控制频率等待、再读取真实状态
+        #
+        # Galaxea 的 ROS2 bridge / 底层跟随可能比 1/HZ 更慢，
+        # 因此允许额外 ACTION_SETTLE_SEC，让返回的 next_obs 更接近动作真正执行后的状态。
+        #
+        # 推荐：
+        #   ACTION_SETTLE_SEC = 0.00  # 最接近原始 15Hz，可能仍有抖动
+        #   ACTION_SETTLE_SEC = 0.05  # 轻量稳定
+        #   ACTION_SETTLE_SEC = 0.08~0.10  # 更稳，采样更慢
+        # ==========================================================
+        self.action_settle_sec = float(getattr(self.config, "ACTION_SETTLE_SEC", 0.0))
+        if self.action_settle_sec < 0:
+            raise ValueError("ACTION_SETTLE_SEC 必须 >= 0")
+
+        self.debug_step_timing = bool(getattr(self.config, "DEBUG_STEP_TIMING", False))
+
+        # ==========================================================
         # 3. 工作空间限位
         # ==========================================================
         xyz_low = np.asarray(self._require_config_attr("XYZ_LIMIT_LOW"), dtype=np.float64)
@@ -717,7 +738,23 @@ class GalaxeaArmEnv(gym.Env):
     # 主 step / close
     # ==========================================================
     def step(self, action: np.ndarray):
-        start_time = time.time()
+        """
+        标准 Gym step。
+
+        关键设计与官方 FrankaEnv 对齐：
+        - 外层 actor / replay 不应该各自实现不同的 sleep/refresh；
+        - env.step 内部统一负责：
+            1) 接收 normalized action；
+            2) clip 到 action_space；
+            3) 发布机器人目标；
+            4) 按 1/HZ 等待一个控制周期；
+            5) 可选额外等待 ACTION_SETTLE_SEC，让 Galaxea 底层更充分跟随；
+            6) 读取最新真实 obs，并更新 _last_valid_state；
+            7) 返回 next_obs。
+
+        这样 replay 和 actor 都只需要调用 env.step(action)，行为一致。
+        """
+        step_start = time.time()
 
         action = np.asarray(action, dtype=np.float32).reshape(-1)
         expected_dim = 14 if self.arm_mode == "dual" else 7
@@ -728,24 +765,62 @@ class GalaxeaArmEnv(gym.Env):
                 f"期望 {expected_dim} 维，实际收到 {action.shape}"
             )
 
-        # 这里仍然保持官方风格：step 接收归一化动作，统一 clip 到 [-1,1]
+        # 官方风格：step 接收归一化动作，统一 clip 到 [-1, 1]。
         action = np.clip(action, self.action_space.low, self.action_space.high)
+
+        # 发布动作。_publish_action 内部会用当前 _last_valid_state 计算增量目标。
+        publish_start = time.time()
         self._publish_action(action)
+        publish_dt = time.time() - publish_start
 
         self.curr_path_length += 1
 
-        dt = time.time() - start_time
-        time.sleep(max(0, (1.0 / self.hz) - dt))
+        # 先按控制频率等待一个周期。
+        elapsed_after_publish = time.time() - step_start
+        hz_sleep = max(0.0, (1.0 / float(self.hz)) - elapsed_after_publish)
+        if hz_sleep > 0:
+            time.sleep(hz_sleep)
 
+        # Galaxea 额外 settle：
+        # 官方 FrankaEnv 在 1/HZ 后读取状态；你的硬件链路实测需要更久时，
+        # 在 env 内加这段，确保 actor/replay/eval 统一。
+        settle_sleep = float(self.action_settle_sec)
+        if settle_sleep > 0:
+            time.sleep(settle_sleep)
+
+        obs_start = time.time()
         obs = self._get_sync_obs()
-        reward = 0
+        obs_dt = time.time() - obs_start
 
+        reward = 0
         terminated = self.terminate
         truncated = self.curr_path_length >= self.max_episode_length
 
+        total_dt = time.time() - step_start
         info = {
             "gripper_debug": self._get_gripper_debug_info(),
+            "step_timing": {
+                "hz": float(self.hz),
+                "target_period_sec": 1.0 / float(self.hz),
+                "publish_dt_sec": float(publish_dt),
+                "hz_sleep_sec": float(hz_sleep),
+                "action_settle_sec": float(settle_sleep),
+                "obs_dt_sec": float(obs_dt),
+                "total_step_dt_sec": float(total_dt),
+                "effective_hz": float(1.0 / total_dt) if total_dt > 1e-9 else 0.0,
+            },
         }
+
+        if self.debug_step_timing:
+            print(
+                "[GalaxeaArmEnv.step timing] "
+                f"publish={publish_dt:.4f}s, "
+                f"hz_sleep={hz_sleep:.4f}s, "
+                f"settle={settle_sleep:.4f}s, "
+                f"obs={obs_dt:.4f}s, "
+                f"total={total_dt:.4f}s, "
+                f"effective_hz={info['step_timing']['effective_hz']:.2f}"
+            )
 
         return obs, reward, terminated, truncated, info
 
@@ -1020,7 +1095,6 @@ class GalaxeaArmEnv(gym.Env):
                 pass
 
         return formatted_obs
-
 
 
 

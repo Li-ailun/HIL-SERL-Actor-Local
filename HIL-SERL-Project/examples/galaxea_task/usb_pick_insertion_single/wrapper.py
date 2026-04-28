@@ -59,9 +59,11 @@ class GalaxeaUSBEnv(GalaxeaArmEnv):
         if not hasattr(config, "RESET_POSE"):
             raise AttributeError("GalaxeaUSBEnv 初始化失败：config 缺少 RESET_POSE")
         self.reset_pose = np.array(config.RESET_POSE, dtype=np.float32)
-
+        
+        #改reset夹爪复位量程
         self.reset_gripper = float(getattr(config, "RESET_GRIPPER", 80.0))
-        self.reset_timeout_sec = float(getattr(config, "RESET_TIMEOUT_SEC", 3.0))
+        #改 reset 执行时长
+        self.reset_timeout_sec = float(getattr(config, "RESET_TIMEOUT_SEC", 5.0))
 
         self.random_reset = bool(getattr(config, "RANDOM_RESET", False))
         self.random_xy_range = float(getattr(config, "RANDOM_XY_RANGE", 0.0))

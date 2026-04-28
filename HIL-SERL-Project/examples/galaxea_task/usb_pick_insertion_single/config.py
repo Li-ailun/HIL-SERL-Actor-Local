@@ -126,9 +126,9 @@ class GalaxeaUSBEnvConfig:
     # ==============================
     RESET_POSE = np.array(
         [
-            0.21,
-            -0.32,
-            -0.15,
+            0.17,
+            -0.36,
+            -0.17,
             0.0,
             0.0,
             0.0,
@@ -147,11 +147,35 @@ class GalaxeaUSBEnvConfig:
 
 
     # ==============================
-    # 2. Env 基础运行参数
+    # 2. Env 基础运行参数（动作卡顿受动作缩放，指令频率，等待时间综合影响，通过反复调试出最佳状态）
+         #频率等延迟等待动作执行完整的延迟越高，录制demos等步数进展越慢，数据录制可能少一些，但是不一定是坏事
     # ==============================
+    #
     HZ = 15
     DISPLAY_IMAGES = True
     MAX_EPISODE_LENGTH = 400
+
+    # ==============================
+    # 2.1 step 等待 / 状态同步
+    # ==============================
+    # 这个参数由 GalaxeaArmEnv.step() 读取。
+    # 作用：每次 env.step(action) 发布动作并等待 1/HZ 后（下面设置成0.00,也不会跑到设置的hz，因为内部本身等待1/x hz），
+    # 额外再等待一点时间，让真实机器人更充分跟随，然后再 _get_sync_obs()。
+    #
+    # 0.00：最接近原始 actor 频率，可能抖
+    # 0.05：建议先试，轻量防抖
+    # 0.08~0.10：更稳，但 actor 采样会更慢
+    ACTION_SETTLE_SEC = 0.2
+
+    # 调试用。True 时 env.step 会打印每步耗时和实际频率。
+    DEBUG_STEP_TIMING = False #True#Fals
+
+    #10 hz，等待0.10s，实际输出5hz，可以保证增量完整执行
+    # 比较好的搭配，
+    #  POS_SCALE = 0.02
+    #  ROT_SCALE = 0.04
+    #  HZ = 10
+    #  ACTION_SETTLE_SEC = 0.10
 
     # ==============================
     # 3. 图像 / 显示配置
@@ -204,8 +228,8 @@ class GalaxeaUSBEnvConfig:
         # ==============================
     # 5. 动作缩放
     # ==============================
-    POS_SCALE = 0.018  # 0.018 m
-    ROT_SCALE = 0.05   # 0.05 rad
+    POS_SCALE = 0.02  # 0.018 m
+    ROT_SCALE = 0.04   # 0.05 rad
     # 夹爪不缩放：action[6] 只表示事件语义
     #   -1 -> close
     #    0 -> hold
@@ -228,11 +252,11 @@ class GalaxeaUSBEnvConfig:
     GRIPPER_CLOSE_LATCH_STEPS = 0
     GRIPPER_OPEN_LATCH_STEPS = 0
 
-# 关键：不要让 feedback 在 close 刚开始时把 memory 覆盖回 open
+    # 关键：不要让 feedback 在 close 刚开始时把 memory 覆盖回 open
     GRIPPER_FEEDBACK_SYNC_MEMORY = False
 
-# 如果 feedback 已经确认闭合/张开，可以提前结束 latch；
-# 但 desired command 仍保持 close/open，不会反向覆盖。
+    # 如果 feedback 已经确认闭合/张开，可以提前结束 latch；
+    # 但 desired command 仍保持 close/open，不会反向覆盖。
     GRIPPER_LATCH_RELEASE_ON_FEEDBACK = True
     #夹爪不缩放，我和官方都是手臂和夹爪先clip，然后手臂缩放，夹爪直接action【6】映射成标签对应的夹爪动作
 
@@ -283,7 +307,7 @@ class GalaxeaUSBTrainConfig(DefaultTrainingConfig):
     max_steps: int = 1_000_000
 
     # Learner 侧经验回放池最大容量
-    replay_buffer_capacity: int = 200_000
+    replay_buffer_capacity: int = 400_000
 
     # actor 前期不走纯随机，直接从策略开始
     random_steps: int = 0
