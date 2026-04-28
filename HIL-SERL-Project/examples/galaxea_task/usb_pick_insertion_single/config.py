@@ -191,7 +191,7 @@ class GalaxeaUSBEnvConfig:
     }
 
     HEAD_CAMERA = {
-        "device_index": 8,   # 用 v4l2-ctl --list-devices 查询
+        "device_index": 2,   # 用 v4l2-ctl --list-devices 查询
         "api": cv2.CAP_V4L2,
         "fourcc": "MJPG",
         "frame_width": 1344,
@@ -204,8 +204,8 @@ class GalaxeaUSBEnvConfig:
     # ==============================
     # 5. 动作缩放
     # ==============================
-    POS_SCALE = 0.01   # 0.01 m
-    ROT_SCALE = 0.05   # 0.05 rad
+    POS_SCALE = 0.018  # 0.018 m
+    ROT_SCALE = 0.01   # 0.052 rad
     #夹爪不缩放，我和官方都是手臂和夹爪先clip，然后手臂缩放，夹爪直接action【6】映射成标签对应的夹爪动作
 
     # ==============================

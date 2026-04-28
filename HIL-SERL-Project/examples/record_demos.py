@@ -82,7 +82,7 @@ flags.DEFINE_string(
 
 flags.DEFINE_integer(
     "successes_needed",
-    20,
+    1,
     "Number of successful demos to collect.",
 )
 

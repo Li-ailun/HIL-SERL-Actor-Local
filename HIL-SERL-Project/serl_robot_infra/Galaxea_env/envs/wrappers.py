@@ -7,7 +7,7 @@
 #    wrapper 用末端前后位姿差反推归一化 action
 #    保存到 info["intervene_action"]
 
-
+#后续 inspect 要看有没有大量 ±1。少量饱和可以接受，大量饱和说明 actor step 太慢、VR 速度太快，或者 scale 太小。
 
 
 import time

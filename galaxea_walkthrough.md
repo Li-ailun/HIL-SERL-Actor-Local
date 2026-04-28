@@ -629,13 +629,15 @@ VR 当前手柄位姿 - 进入 VR 接管瞬间的手柄位姿
 ########################知识十八（改进）
 
 （1）取消记录vr手柄位姿（手柄位姿发漂）
+后续 inspect 要看有没有大量 ±1。少量饱和可以接受，大量饱和说明 actor step 太慢、VR 速度太快，或者 scale 太小。
+
 （2）解决vr介入时actor记录不全动作（不要卡顿时候有vr数据）
 分析：我的vr优先级很高，因为只要切换mode0立马vr接管，而官网的是正常actor输出，需要接管立马移动摇杆，而我的必须先切换到mode0.
 （3）打印critic评分，一直是0之类的肯定不对
 （4）播放轨迹动作，看看记录的数据是不是对的
 （5）增加训练时间
 （6）增大buffer容量
-
+（7）增加demos条数
 
 
 
@@ -646,6 +648,43 @@ VR 当前手柄位姿 - 进入 VR 接管瞬间的手柄位姿
 ####
 
 
-###################知识十九（动作）
+###################知识十九
 
 
+最新改动：改动了不用vr手柄计算增量，使用末端反馈反推增量。
+   执行replay_demo_action脚本，回放动作，计算出合适的动作缩放
+   action[:6] normalized
+= demo 里保存的归一化动作
+≈ actor 网络未来会输出的动作格式
+
+expected pos/rot delta
+= action[:6] * POS_SCALE / ROT_SCALE
+= 理论上 env 想让机器人执行的真实增量
+
+live obs-delta action[:6]
+= 真机 replay 后，实际末端运动 / POS_SCALE / ROT_SCALE
+= 真实执行结果反推出来的动作
+
+所以，action[:6] normalized 相当于 actor 网络输出的动作格式；expected pos/rot delta 才是缩放后的理论真实动作；live obs-delta action[:6] 才是真机最终实际走出来的动作结果。
+demo max_abs_error 基本接近 0
+live max_abs_error mean/max = 0.176673 / 0.809571
+live_error_warn_count = 31
+
+这说明 demo 内部记录是自洽的，也就是 demo action 和 demo 记录的末端前后位姿能互相反推上；CSV 里也能看到 action、expected delta、demo_delta_action 这些字段正是这个对应关系。
+但是 真机 replay 时，env.step(action) 后实际末端没有完全走到 expected delta。这就是你说的“动作移动距离变小，没有到达真实位置”。
+
+1. 可以根据 replay 结果计算正确缩放吗？
+
+可以，但只能在“误差主要是稳定比例误差”的情况下可靠。
+
+
+
+#####
+####
+#####
+
+
+###############知识二十
+
+(1)执行replay_demo_action时，夹爪好像不能完全闭合呢？不是执行量程10的指令吗？
+(2)微小动作范围输出实际动作抖动更大
