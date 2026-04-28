@@ -20,7 +20,9 @@ train_rlpd.py
 本版核心目标：
 1) 网络更新改成接近官方 HIL-SERL 结构：
    - actor 注册 client.recv_network_callback(update_params)
-   - 收到网络后直接替换 actor 参数
+   - 收到网络后只缓存为 pending_params；
+               episode 内不替换 actor 参数；
+               episode 结束 / reset 后 / 下一条 episode 第一帧前再 apply pending 网络。
    - episode 内不后台 update、不周期性 update、不 loop_start apply
    - episode 结束后 client.update()
    - reset 后等待网络更新，再开始下一 episode 第一帧动作
@@ -46,7 +48,7 @@ WAIT_NETWORK_AFTER_EVERY_RESET = True
 NETWORK_WAIT_REQUIRE_NEW = True
 # None 表示无限等待，最符合“必须保证更新到网络再输出动作”。
 # 如果不想因为 learner 没 publish 而永久等待，可以改成 30.0（等待30s）。
-NETWORK_WAIT_TIMEOUT_SEC = None
+NETWORK_WAIT_TIMEOUT_SEC = None  # 如需避免 learner 暂停导致 actor 永久等待，可改成 30.0
 NETWORK_WAIT_RETRY_SLEEP_SEC = 0.10
 # episode 结束后是否先 update，再 reset；保留 True。
 UPDATE_AT_EPISODE_END_BEFORE_RESET = True
@@ -1166,7 +1168,7 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng, config, traine
     _log_info(
         "main",
         f"[actor-obs-prune-config] actor_to_learner_image_keys={actor_to_learner_image_keys}. "
-        f"episode 内不进行网络 update；episode/reset 后同步网络。",
+        f"episode 内 callback 只缓存 pending 网络；只在 episode/reset 边界 apply 网络。",
         "green",
     )
 
@@ -1218,13 +1220,29 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng, config, traine
     )
 
     network_debug = {
+        # 收到 learner broadcast 的次数。callback 收到就加，即使 episode 内不 apply。
         "recv_count": 0,
+
+        # 真正替换 actor agent 参数的次数。只允许在 episode/reset 边界增加。
         "applied_count": 0,
+
+        # 收到的网络与当前已应用网络完全相同的次数。
         "duplicate_recv_count": 0,
+
+        # 收到的网络与 pending 网络完全相同的次数。
+        "pending_duplicate_recv_count": 0,
+
         "last_recv_time": None,
         "last_apply_time": None,
         "last_sig": None,
         "last_applied_sig": None,
+
+        # pending 网络：callback 只写这里，不直接改 agent。
+        "pending_params": None,
+        "pending_sig": None,
+        "pending_recv_count": 0,
+        "pending_recv_time": None,
+
         "last_update_log_time": None,
     }
     agent_lock = threading.Lock()
@@ -1232,15 +1250,21 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng, config, traine
 
     def update_params(params):
         """
-        只在 client.update() 被调用时触发；而本脚本只在 episode/reset 边界调用 client.update()，
-        因此不会在 episode 中途替换 actor 网络。
+        网络 callback 只做一件事：缓存 learner 发来的最新网络到 pending。
 
-        重要：
-        recv_count 表示“收到了 learner 的一次网络广播”，即使参数和上一版完全相同也会递增。
-        applied_count 表示“参数确实不同并已替换 actor agent”。
-        这样 reset 后等待网络时，不会因为 learner warmup 阶段重发相同初始网络而永久等待。
+        绝对不要在这里 agent.replace(...)。
+        原因：
+          TrainerClient 的 recv_network_callback 可能由 broadcast 线程异步触发；
+          如果这里直接 apply，网络会在 episode 中途切换，导致同一条 episode 混合多个 policy 版本。
+
+        正确行为：
+          episode 内：
+            收到网络 -> pending_params = params
+            actor 继续用当前已应用网络输出动作
+
+          episode_end / reset 后 / 第一帧动作前：
+            _apply_pending_network(...) -> 这时才替换 agent
         """
-        nonlocal agent
         now = time.time()
         since_prev = None if network_debug["last_recv_time"] is None else now - network_debug["last_recv_time"]
         sig = _tree_debug_signature(params)
@@ -1252,32 +1276,98 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng, config, traine
 
             if network_debug["last_applied_sig"] == sig:
                 network_debug["duplicate_recv_count"] += 1
-                duplicate_n = network_debug["duplicate_recv_count"]
-                if (not FLAGS.minimal_logs) and (duplicate_n <= 3 or duplicate_n % 10 == 0):
-                    _log_info(
-                        "actor_network",
-                        f"[actor-network-recv-duplicate] recv_count={network_debug['recv_count']}, "
-                        f"duplicate_recv_count={duplicate_n}, applied_count={network_debug['applied_count']}, "
-                        f"since_prev={None if since_prev is None else round(since_prev, 3)}, {_format_signature(sig)}",
-                        "blue",
-                    )
-                return
 
-            params = jax.tree_util.tree_map(jnp.array, params)
-            agent = agent.replace(state=agent.state.replace(params=params))
+            if network_debug["pending_sig"] == sig:
+                network_debug["pending_duplicate_recv_count"] += 1
+
+            # 只缓存最新版 pending 网络；旧 pending 被覆盖。
+            network_debug["pending_params"] = params
+            network_debug["pending_sig"] = sig
+            network_debug["pending_recv_count"] = network_debug["recv_count"]
+            network_debug["pending_recv_time"] = now
+
+            recv_count = network_debug["recv_count"]
+            applied_count = network_debug["applied_count"]
+            pending_dup = network_debug["pending_duplicate_recv_count"]
+            applied_dup = network_debug["duplicate_recv_count"]
+
+        if not FLAGS.minimal_logs:
+            _log_info(
+                "actor_network",
+                f"[actor-network-recv-pending] recv_count={recv_count}, applied_count={applied_count}, "
+                f"duplicate_vs_applied={applied_dup}, duplicate_vs_pending={pending_dup}, "
+                f"since_prev={None if since_prev is None else round(since_prev, 3)}, {_format_signature(sig)}",
+                "blue",
+            )
+
+    def _apply_pending_network(reason, *, force=False):
+        """
+        只允许在 episode/reset 边界调用。
+
+        返回：
+          True  = 成功应用了一版与当前已应用网络不同的 pending 网络
+          False = 没有 pending，或 pending 与当前已应用网络相同
+        """
+        nonlocal agent
+
+        with agent_lock:
+            pending_params = network_debug.get("pending_params", None)
+            pending_sig = network_debug.get("pending_sig", None)
+            pending_recv_count = network_debug.get("pending_recv_count", 0)
+
+            if pending_params is None:
+                _log_info(
+                    "actor_network",
+                    f"[actor-network-apply-skip] reason={reason}, no pending network. "
+                    f"recv_count={network_debug['recv_count']}, applied_count={network_debug['applied_count']}",
+                    "yellow" if force else "blue",
+                )
+                return False
+
+            if (not force) and network_debug["last_applied_sig"] == pending_sig:
+                # 已应用过同 signature 的网络。清掉 pending，避免边界重复 apply。
+                network_debug["pending_params"] = None
+                network_debug["pending_sig"] = None
+                network_debug["pending_recv_count"] = 0
+                network_debug["pending_recv_time"] = None
+
+                _log_info(
+                    "actor_network",
+                    f"[actor-network-apply-skip] reason={reason}, pending equals current applied. "
+                    f"recv_count={network_debug['recv_count']}, applied_count={network_debug['applied_count']}, "
+                    f"pending_recv_count={pending_recv_count}, {_format_signature(pending_sig)}",
+                    "blue",
+                )
+                return False
+
+            # 关键：只有这里才真正替换 actor agent。
+            params_jnp = jax.tree_util.tree_map(jnp.array, pending_params)
+            agent = agent.replace(state=agent.state.replace(params=params_jnp))
+
             network_debug["applied_count"] += 1
-            network_debug["last_apply_time"] = now
-            network_debug["last_applied_sig"] = sig
+            network_debug["last_apply_time"] = time.time()
+            network_debug["last_applied_sig"] = pending_sig
+
+            # pending 已消费。
+            network_debug["pending_params"] = None
+            network_debug["pending_sig"] = None
+            network_debug["pending_recv_count"] = 0
+            network_debug["pending_recv_time"] = None
+
+            applied_count = network_debug["applied_count"]
+            recv_count = network_debug["recv_count"]
 
         _log_info(
             "actor_network",
-            f"[actor-network-recv-apply] recv_count={network_debug['recv_count']}, applied_count={network_debug['applied_count']}, "
-            f"since_prev={None if since_prev is None else round(since_prev, 3)}, {_format_signature(sig)}",
-            "blue",
+            f"[actor-network-apply-boundary] reason={reason}, recv_count={recv_count}, "
+            f"applied_count={applied_count}, pending_recv_count={pending_recv_count}, "
+            f"{_format_signature(pending_sig)}",
+            "green",
         )
+        return True
 
     client.recv_network_callback(update_params)
-    _log_info("actor_network", "[actor-client-init] recv_network_callback registered; direct apply enabled.", "blue")
+    _log_info("actor_network", "[actor-client-init] recv_network_callback registered; pending-only apply enabled.", "blue")
     if FLAGS.ip == "localhost" and getattr(trainer_cfg, "broadcast_port", None):
         _log_info(
             "actor_warning",
@@ -1302,12 +1392,21 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng, config, traine
                 "actor_network",
                 f"[actor-client-update] reason={reason}, ok={ok}, dt={dt:.3f}s, "
                 f"recv_count={network_debug['recv_count']}, applied_count={network_debug['applied_count']}, "
+                f"pending_recv_count={network_debug.get('pending_recv_count', 0)}, "
                 f"duplicate_recv_count={network_debug['duplicate_recv_count']}, err={err}",
                 color,
             )
         return ok
 
     def _wait_for_network(reason, *, require_new=NETWORK_WAIT_REQUIRE_NEW, timeout_sec=NETWORK_WAIT_TIMEOUT_SEC):
+        """
+        边界等待网络广播，然后在同一个边界 apply pending 网络。
+
+        注意：
+          wait 的判断依据是 recv_count 是否增加；
+          apply 的判断依据是 pending_sig 是否不同于 last_applied_sig。
+          因此即使 learner 重发相同网络，也不会卡死，也不会重复 apply。
+        """
         before = int(network_debug["recv_count"])
         t0 = time.time()
         _log_info(
@@ -1320,16 +1419,21 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng, config, traine
             after = int(network_debug["recv_count"])
             got_new = after > before
             if not require_new or got_new:
+                applied = _apply_pending_network(f"{reason}:after_wait")
                 _log_info(
                     "actor_network",
-                    f"[actor-network-wait-done] reason={reason}, recv_count={after}, got_new_broadcast={got_new}, applied_count={network_debug['applied_count']}",
+                    f"[actor-network-wait-done] reason={reason}, recv_count={after}, "
+                    f"got_new_broadcast={got_new}, applied_now={applied}, applied_count={network_debug['applied_count']}",
                     "green",
                 )
                 return got_new
             if timeout_sec is not None and (time.time() - t0) >= float(timeout_sec):
+                # 超时也尝试应用已有 pending。比如 pending 是 reset 期间收到的，但没有等到“更新的一条”。
+                applied = _apply_pending_network(f"{reason}:timeout_apply_existing")
                 _log_info(
                     "actor_warning",
-                    f"[actor-network-wait-timeout] reason={reason}, 没等到新网络，继续使用当前网络。 recv_count={after}",
+                    f"[actor-network-wait-timeout] reason={reason}, 没等到新网络，继续使用当前/已缓存网络。 "
+                    f"recv_count={after}, applied_now={applied}, applied_count={network_debug['applied_count']}",
                     "yellow",
                 )
                 return False
@@ -1341,6 +1445,9 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng, config, traine
     obs, _ = env.reset()
     if WAIT_NETWORK_BEFORE_FIRST_ACTION:
         _wait_for_network("initial_after_reset_before_first_action")
+    else:
+        # 即使不等待，也只允许在第一帧前这个边界应用已有 pending。
+        _apply_pending_network("initial_after_reset_no_wait")
 
     timer = Timer()
     running_return = 0.0
@@ -1442,7 +1549,8 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng, config, traine
                     print_blue(
                         f"[actor-step-debug] step={step}, action_source={action_source}, reward={reward}, "
                         f"done={done}, truncated={truncated}, recv_count={network_debug['recv_count']}, "
-                        f"applied_count={network_debug['applied_count']}, since_last_recv={since_last_recv}, "
+                        f"applied_count={network_debug['applied_count']}, pending_recv_count={network_debug.get('pending_recv_count', 0)}, "
+                        f"since_last_recv={since_last_recv}, "
                         f"replay_queue={len(data_store)}, intvn_queue={len(intvn_data_store)}, "
                         f"stored_gripper={describe_gripper_three_value(actions[6]) if actions.shape[0] == 7 else 'N/A'}, "
                         f"policy_raw={describe_gripper_three_value(policy_actions[6]) if policy_actions.shape[0] == 7 else 'N/A'}, "
@@ -1480,13 +1588,19 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng, config, traine
 
                     if UPDATE_AT_EPISODE_END_BEFORE_RESET:
                         _client_update("episode_end_before_reset", force_print=True)
+                        _apply_pending_network("episode_end_before_reset")
 
                     obs, _ = env.reset()
 
                     if WAIT_NETWORK_AFTER_EVERY_RESET:
                         if UPDATE_AFTER_RESET_BEFORE_WAIT:
                             _client_update("after_reset_pre_wait", force_print=True)
+                            # reset 已结束、下一条 episode 未开始，这是安全边界。
+                            _apply_pending_network("after_reset_pre_wait")
                         _wait_for_network("after_reset_before_next_episode_first_action")
+                    else:
+                        # 不等待时，也在 reset 后边界应用一次 reset 期间收到的 pending。
+                        _apply_pending_network("after_reset_no_wait")
 
             if step > 0 and config.buffer_period > 0 and step % config.buffer_period == 0:
                 _save_periodic_actor_buffers(
@@ -1514,7 +1628,9 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng, config, traine
         remaining_demo = len(demo_transitions)
         print_yellow(
             f"[actor-exit] actor loop exited. Unsaved partial buffers are discarded by design: "
-            f"online={remaining_online}, demo={remaining_demo}. "
+            f"online={remaining_online}, demo={remaining_demo}, "
+            f"pending_recv_count={network_debug.get('pending_recv_count', 0)}, "
+            f"recv_count={network_debug.get('recv_count', 0)}, applied_count={network_debug.get('applied_count', 0)}. "
             f"Only periodic numeric files transitions_1000.pkl, transitions_2000.pkl, ... are persisted."
         )
 
@@ -1860,6 +1976,7 @@ def main(_):
 
 if __name__ == "__main__":
     app.run(main)
+
 
 
 
