@@ -1,6 +1,6 @@
 # 使用方法
 # 1. 自动读取当前目录最新 pkl
-# python play_demo_merged_full.py
+# python play_demos_pkl.py 
 # 2. 手动指定 pkl
 # python play_demo_merged_full.py --pkl /your/path/demo_xxx.pkl
 # 3. 指定播放速度

@@ -156,8 +156,8 @@ from examples.galaxea_task.usb_pick_insertion_single.config import env_config
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string("exp_name", "galaxea_usb_insertion_single", "Name of experiment.")
-flags.DEFINE_integer("successes_needed", 30, "Number of successful demos to collect.")
-flags.DEFINE_integer("max_episode_steps", 650, "Maximum env steps per demo episode.")
+flags.DEFINE_integer("successes_needed", 5, "Number of successful demos to collect.")
+flags.DEFINE_integer("max_episode_steps", 400, "Maximum env steps per demo episode.")
 flags.DEFINE_boolean("classifier", True, "Whether to use reward classifier as success/end signal.")
 flags.DEFINE_boolean("save_video", False, "Whether to save video during recording.")
 flags.DEFINE_boolean("manual_confirm_on_success", False, "Manually confirm success even when classifier says succeed=True.")
@@ -878,6 +878,23 @@ def wait_for_vr_takeover_no_env_step(env, ros_sub, reason):
             last_print_t = now
         time.sleep(float(FLAGS.wait_vr_poll_sec))
 
+
+def read_control_mode_from_ros_or_env(env, ros_sub):
+    """
+    优先从 ROS subscriber 读 control_mode；
+    读不到再从 env / wrapper 属性读。
+    不调用 env.step。
+    """
+    snap = ros_sub.snapshot() if ros_sub is not None else None
+    if snap is not None and snap.get("control_mode") is not None:
+        return int(snap["control_mode"]), "ros_sub.control_mode"
+
+    mode, source = try_read_control_mode_from_env(env)
+    if mode is not None:
+        return int(mode), source
+
+    return None, None
+
 # =============================================================================
 # 9. raw recording helpers
 # =============================================================================
@@ -981,6 +998,44 @@ def record_raw_absolute_demos():
 
     try:
         while success_count < int(FLAGS.successes_needed):
+            # ----------------------------------------------------------
+            # 关键修复：
+            # 录制 demo 只允许在 VR Mode0 下 env.step。
+            # 如果用户切回 Mode2，暂停录制，不调用 env.step，不发送 zero。
+            # 重新回到 Mode0 后，用 observe-only 刷新一次 obs，但不记录该刷新帧。
+            # ----------------------------------------------------------
+            mode, mode_source = read_control_mode_from_ros_or_env(env, ros_sub)
+            expected_vr_mode = int(FLAGS.vr_control_mode_value)
+
+            if mode is not None and int(mode) != expected_vr_mode:
+                print_yellow(
+                    f"\n⏸️ 当前不是 VR Mode0，暂停录制。"
+                    f" control_mode={mode} from {mode_source}，"
+                    "不调用 env.step，不发送 zero action。"
+                )
+
+                wait_for_vr_takeover_no_env_step(
+                    env,
+                    ros_sub,
+                    reason="pause_until_vr_mode_back_during_episode",
+                )
+
+                # 回到 Mode0 后刷新 obs。
+                # 注意：这里 env.step(zero) 会被 VRInterventionWrapper 改为 observe_only_step，
+                # 因此不会发布 arm / gripper 命令。
+                try:
+                    refresh_action = np.zeros(env.action_space.shape, dtype=np.float32)
+                    obs, _, _, _, refresh_info = env.step(refresh_action)
+                    print_green(
+                        "✅ 已回到 VR Mode0，并完成 observe-only obs refresh。"
+                        f" observe_only={refresh_info.get('observe_only', None)}, "
+                        f"vr_observe_only={refresh_info.get('vr_observe_only', None)}"
+                    )
+                except Exception as e:
+                    print_yellow(f"⚠️ 回到 VR Mode0 后刷新 obs 失败，将继续使用上一帧 obs: {e!r}")
+
+                continue
+
             raw_actions = np.zeros(env.action_space.shape, dtype=np.float32)
 
             before_pose_snapshot = ros_sub.snapshot()
@@ -1442,7 +1497,7 @@ def save_converted_outputs(raw_payload, sources):
     print_green(f"   convert sources = {sources}")
 
     raw_episodes = raw_payload["episodes"]
-    converted_save_dir = FLAGS.converted_save_dir or os.path.join(EXAMPLES_DIR, "demo_data_single")
+    converted_save_dir = FLAGS.converted_save_dir or os.path.join(EXAMPLES_DIR, "demo_data_single1")
     report_save_dir = FLAGS.report_save_dir or converted_save_dir
     ensure_dir(converted_save_dir)
     ensure_dir(report_save_dir)

@@ -231,7 +231,7 @@ class GalaxeaUSBEnvConfig:
     # POS_SCALE = 0.02  # 0.018 m
     # ROT_SCALE = 0.04   # 0.05 rad
     POS_SCALE = 0.02  # 0.018 m
-    ROT_SCALE = 0.03   # 0.05 rad
+    ROT_SCALE = 0.04   # 0.05 rad
     # 夹爪不缩放：action[6] 只表示事件语义
     #   -1 -> close
     #    0 -> hold

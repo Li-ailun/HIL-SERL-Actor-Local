@@ -23,13 +23,13 @@ inspect_demo_pkl_all.py
 
 # 检查目录下所有 pkl，并输出每个文件 + 总计
 python inspect_demo_pkl.py \
-  --dir /home/eren/HIL-SERL/HIL-SERL-Project/examples/demo_data_single \
+  --dir /home/eren/HIL-SERL/HIL-SERL-Project/examples/demo_data_singl \
   --all \
   --image_keys head_rgb right_wrist_rgb
 
 # 只检查最新 pkl，输出详细信息
 python inspect_demo_pkl.py \
-  --dir /home/eren/HIL-SERL/HIL-SERL-Project/examples/demo_data_single \
+  --dir /home/eren/HIL-SERL/HIL-SERL-Project/examples/demo_data_single1 \
   --image_keys head_rgb right_wrist_rgb
 
 # 指定某个 pkl

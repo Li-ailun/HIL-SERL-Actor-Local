@@ -159,7 +159,7 @@ HW_OPEN_MIN = 70.0
 # legacy demo 没有 metadata 时，用手动 scale 做离线提示。
 # 本脚本不做动作转换，只打印检查。
 MANUAL_DEMO_POS_SCALE = 0.02
-MANUAL_DEMO_ROT_SCALE = 0.03
+MANUAL_DEMO_ROT_SCALE = 0.04
 MANUAL_DEMO_HZ = 10
 
 STRICT_SCALE_FOR_LIVE_REPLAY = True
