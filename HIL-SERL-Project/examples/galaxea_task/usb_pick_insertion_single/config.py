@@ -126,8 +126,8 @@ class GalaxeaUSBEnvConfig:
     # ==============================
     RESET_POSE = np.array(
         [
-            0.17,
-            -0.36,
+            0.14,
+            -0.29,
             -0.17,
             0.0,
             0.0,
@@ -215,7 +215,7 @@ class GalaxeaUSBEnvConfig:
     }
 
     HEAD_CAMERA = {
-        "device_index": 6,   # 用 v4l2-ctl --list-devices 查询
+        "device_index": 2,   # 用 v4l2-ctl --list-devices 查询
         "api": cv2.CAP_V4L2,
         "fourcc": "MJPG",
         "frame_width": 1344,
@@ -228,8 +228,10 @@ class GalaxeaUSBEnvConfig:
         # ==============================
     # 5. 动作缩放
     # ==============================
+    # POS_SCALE = 0.02  # 0.018 m
+    # ROT_SCALE = 0.04   # 0.05 rad
     POS_SCALE = 0.02  # 0.018 m
-    ROT_SCALE = 0.04   # 0.05 rad
+    ROT_SCALE = 0.03   # 0.05 rad
     # 夹爪不缩放：action[6] 只表示事件语义
     #   -1 -> close
     #    0 -> hold

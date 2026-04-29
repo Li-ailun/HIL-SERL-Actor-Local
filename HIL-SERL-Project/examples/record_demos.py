@@ -1,200 +1,256 @@
-#录制专家轨迹，用于后续先bc再强化学习（人类在环监督或者无监督两种方式）
+"""
+record_abs_pose_demos_and_convert.py
 
-#该脚本的本质：（1）记录intervene_action（把供bc模仿学习的完美演示数据和共强化学习的人类介入数据都定义为intervene_action，这两个数据都保存仅专家池）
-#           （2）所以即使这是录制脚本，也是依靠intervene_action信号记录数据的
+录制 raw absolute demos，并离线转换成当前 RLPD/SERL 训练使用的相对增量 demo pkl。
 
-#该脚本构成（高度模块化）
-#（1）数据输入接口：无该内容，输入接口都在dual_galaxea_env.py里封装好了，只要dual_galaxea_env.py能正常收到需要的数据，则完成；
-#（2）怎么录制：无该内容，录制控制都在wrappers.py里封装好了，此处录制的完整流程演示数据和wrappers.py的vr接管数据都被存入专家经验池（Demo Buffer））里
-#（3）存放路径：存进 demo_data 文件夹
-#（4）何时停止录制：
-#       1,基于wrappers.py定义的mode0无人类介入，
-                 #mode2人类介入的逻辑： 一旦切入 mode2，它就在这一帧的数据里挂上一个牌子（info["intervene_action"] = ...）。
-                 #mode0时不记录，mode2后才记录
-#       2,预设固定步长时间，超时自动停止录制
-#       3,所以mode2提前结束任务，等待补偿结束，自动记录完美演示数据 
+记录内容：
+  - observations / next_observations：图像、state 等 env 输出
+  - gripper feedback：从 obs["state"] 最后一维或 gripper key 提取
+  - feedback pose：/motion_control/pose_ee_arm_right
+  - target pose  ：/motion_target/target_pose_arm_right
 
-#总逻辑：
-# dual_galaxea_env.py (底层)：负责和星海图的相机、机械臂打交道，把物理世界的声光电变成 NumPy 数组。
-# wrappers.py (中层)：智能安检，负责监听你的 VR 手柄，把人类的动作替换进去，并贴上 intervene_action 的 VIP 标签。
-# record_demos.py / train_rlpd.py (顶层)：数据分拣员。
-#      只管看着 info 字典，看到有 VIP 标签的数据，就直接往专家经验池（Demo Buffer）里扔。
-#      如果没有标签，就扔进在线探索池（Replay Buffer）。
+转换方式：
+  1 = feedback 版本：用 /motion_control/pose_ee_arm_right 生成 action[:6]
+  2 = target   版本：用 /motion_target/target_pose_arm_right 生成 action[:6]
+  3 = both     版本：两个版本都导出，并比较二者增量误差
 
-# 默认 20 条成功 demo：
-# python record_demos.py
+最终导出的训练 pkl 格式：
+  list[transition]
+  transition = {
+    "observations", "actions", "next_observations", "rewards", "masks", "dones", "infos", "grasp_penalty"
+  }
+  actions.shape == (7,)
+  action[:6] = normalized relative delta pose, clipped to [-1, 1]
+  action[6]  = gripper event label: close=-1, hold=0, open=+1
 
-# 限制每条最多 300 步：
-# python record_demos.py --max_episode_steps=300
+典型用法：
+  # 录制 raw，并在末尾输入 1/2/3 选择转换版本（反馈，指令，都导出并计算两者误差）
+  python record_abs_pose_demos_and_convert.py 
+    --successes_needed=20 
+    --convert_source=prompt
 
-# 先少录几条测试：
-# python record_demos.py --successes_needed=2 --max_episode_steps=200
+  #如果后续需要改变动作缩放测试效果，直接修改具体任务的config，或者如下手动指定动作缩放：
+  python record_abs_pose_demos_and_convert.py \
+  --raw_input_path ./raw_abs_demo_data_single/galaxea_usb_insertion_single_20_raw_abs_xxx.pkl \
+  --convert_source=target \
+  --pos_scale=0.02 \
+  --rot_scale=0.04
+
+  # 不重新录制，只用已有 raw 重新转换 target 版本
+  python record_abs_pose_demos_and_convert.py \
+    --raw_input_path ./raw_abs_demo_data_single/xxx_raw_abs.pkl \
+    --convert_source=target
 
 
-#不过滤静止帧再保存demos（ros2 topic echo /motion_control/pose_ee_arm_right可以确认vr暂停后数值不会变化，所以可以视为静止帧 ）
-#（可以回放录制的demos，看看动作是不是流畅的）
+"""
 
-#录制的action【6】官方代表持续的张开/闭合命令，我们修改自己的情况，让其符合想闭合就显示一直闭合，想张开就一直张开的情况
+"""
+record_abs_pose_demos_and_convert_wait_vr.py
 
-##和官方一致
-#不过滤静止帧，防止最后成功时被判定到静止帧范围从而demos不完整
-#三值夹爪标签(可视化demos来判断是否准确实现）
+在原 demo 录制逻辑基础上，只增加 raw absolute pose 记录和离线转换功能。
+
+关键保持不变 / 特别注意：
+1. reset 后不会立刻 env.step(zero)。
+   reset 后脚本只等待 VR mode 切换；等待期间不调用 env.step，不发送 zero action。
+2. 检测到 VR 接管后，才进入原来的 env.step(raw_actions=zeros) 录制循环。
+3. 成功/失败、classifier、manual_confirm、静止帧过滤、max_episode_steps 逻辑保持原录制脚本风格。
+4. 新增记录：
+   - observations / next_observations
+   - reward / done / truncated / info
+   - gripper_feedback_before / after
+   - raw_intervene_action
+   - /motion_control/pose_ee_arm_right before / after
+   - /motion_target/target_pose_arm_right before / after
+5. 录完后离线转换成当前 RLPD/SERL 可读的标准 demo pkl：
+   transition = {
+       observations,
+       actions: [dx, dy, dz, droll, dpitch, dyaw, gripper_event],
+       next_observations,
+       rewards,
+       masks,
+       dones,
+       infos,
+       grasp_penalty,
+   }
+
+转换选择：
+  1 / feedback：用 /motion_control/pose_ee_arm_right 反馈位姿生成 action[:6]
+  2 / target  ：用 /motion_target/target_pose_arm_right 指令位姿生成 action[:6]
+  3 / both    ：两个版本都导出，并计算两者增量误差
+
+典型录制：
+  python record_abs_pose_demos_and_convert_wait_vr.py \
+    --successes_needed=20 \
+    --classifier=True \
+    --convert_source=prompt
 
 
+只重新转换已有 raw，不重新录：
+  python record_demos.py \
+    --raw_input_path ./raw_abs_demo_data_single/galaxea_usb_insertion_single_1_raw_abs_2026-04-29_14-40-08.pkl \
+    --convert_source=feedback \
+    --pos_scale=0.01 \
+    --rot_scale=0.03 \
+    --converted_save_dir ./demo_data_single
+"""
+
+# =============================================================================
+# 0. 像 actor 一样，先强制本地 CPU，避免 classifier=True 时本地环境炸
+# =============================================================================
 import os
 import sys
-import time
 
-# ==============================================================
-# 像 actor 一样，先强制本地 CPU，避免 classifier=True 时本地环境炸
-# ==============================================================
-os.environ["JAX_PLATFORMS"] = "cpu"
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ.pop("JAX_PLATFORMS", None)
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
-from tqdm import tqdm
-import numpy as np
+# =============================================================================
+# 1. imports
+# =============================================================================
 import copy
-import pickle as pkl
 import datetime
-from absl import app, flags
+import json
+import math
+import pickle as pkl
+import threading
+import time
+from collections import Counter
 
-# ==============================================================
-# 核心路径配置
-# ==============================================================
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+import numpy as np
+from absl import app, flags
+from tqdm import tqdm
+
+try:
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+    from geometry_msgs.msg import PoseStamped
+    from std_msgs.msg import Int8, Int16, Int32, UInt8, UInt16, UInt32
+except Exception as e:
+    rclpy = None
+    Node = object
+    PoseStamped = None
+    Int8 = Int16 = Int32 = UInt8 = UInt16 = UInt32 = None
+    _ROS_IMPORT_ERROR = e
+else:
+    _ROS_IMPORT_ERROR = None
+
+# =============================================================================
+# 2. 路径配置
+# =============================================================================
+THIS_DIR = os.path.abspath(os.path.dirname(__file__))
+if os.path.basename(THIS_DIR) == "inspect":
+    EXAMPLES_DIR = os.path.abspath(os.path.join(THIS_DIR, ".."))
+else:
+    EXAMPLES_DIR = THIS_DIR
+
+PROJECT_ROOT = os.path.abspath(os.path.join(EXAMPLES_DIR, ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
 from examples.galaxea_task.usb_pick_insertion_single.config import env_config
 
-
-# ==============================================================
-# 命令行参数配置
-# ==============================================================
+# =============================================================================
+# 3. flags
+# =============================================================================
 FLAGS = flags.FLAGS
 
+flags.DEFINE_string("exp_name", "galaxea_usb_insertion_single", "Name of experiment.")
+flags.DEFINE_integer("successes_needed", 30, "Number of successful demos to collect.")
+flags.DEFINE_integer("max_episode_steps", 650, "Maximum env steps per demo episode.")
+flags.DEFINE_boolean("classifier", True, "Whether to use reward classifier as success/end signal.")
+flags.DEFINE_boolean("save_video", False, "Whether to save video during recording.")
+flags.DEFINE_boolean("manual_confirm_on_success", False, "Manually confirm success even when classifier says succeed=True.")
+
+# raw recording / conversion mode
+flags.DEFINE_string("raw_input_path", "", "If set, skip robot recording and only convert this raw absolute demo pkl.")
+flags.DEFINE_string("convert_source", "prompt", "prompt / feedback / target / both, or 1 / 2 / 3.")
+
+# ROS pose topics
+flags.DEFINE_string("feedback_pose_topic", "/motion_control/pose_ee_arm_right", "Actual EE feedback PoseStamped topic.")
+flags.DEFINE_string("target_pose_topic", "/motion_target/target_pose_arm_right", "Target command PoseStamped topic.")
+flags.DEFINE_float("wait_initial_pose_sec", 2.0, "Wait seconds for initial pose messages after subscriber starts.")
+
+# Optional control mode topic. 如果不设置，会尝试从 env 属性读；读不到则人工回车确认。
 flags.DEFINE_string(
-    "exp_name",
-    "galaxea_usb_insertion_single",
-    "Name of experiment corresponding to folder.",
+    "control_mode_topic",
+    "",
+    "Optional std_msgs integer topic for control mode. Empty means try env attrs, then manual Enter fallback.",
 )
-
-flags.DEFINE_integer(
-    "successes_needed",
-    20,
-    "Number of successful demos to collect.",
-)
-
-flags.DEFINE_integer(
-    "max_episode_steps",
-    400,
-    "Maximum number of recorded steps per demo episode before forcing truncation.",
-)
-
+flags.DEFINE_integer("vr_control_mode_value", 0, "Control mode value that means VR control/takeover.")
+flags.DEFINE_float("wait_vr_poll_sec", 0.05, "Polling sleep while waiting VR takeover without env.step.")
 flags.DEFINE_boolean(
-    "classifier",
+    "manual_start_if_no_control_mode",
     True,
-    "Whether to use reward classifier as the success/end signal.",
+    "If true, when control mode cannot be read automatically, ask user to press Enter after switching VR mode.",
 )
 
+# output dirs
+flags.DEFINE_string("raw_save_dir", "", "Raw absolute demo output directory. Empty = examples/raw_abs_demo_data_single.")
+flags.DEFINE_string("converted_save_dir", "", "Converted train demo output directory. Empty = examples/demo_data_single.")
+flags.DEFINE_string("report_save_dir", "", "Diagnostic report output directory. Empty = converted_save_dir.")
+
+# normalization
+flags.DEFINE_float("pos_scale", 0.0, "Override POS_SCALE. 0 means use config.POS_SCALE.")
+flags.DEFINE_float("rot_scale", 0.0, "Override ROT_SCALE. 0 means use config.ROT_SCALE.")
+flags.DEFINE_boolean("clip_action", True, "Clip normalized action[:6] to [-1, 1].")
+
+# gripper / penalty
+flags.DEFINE_float("grasp_penalty_value", -0.02, "Penalty for close/open gripper event.")
+flags.DEFINE_float("feedback_close_max", 30.0, "Gripper feedback <= close_max means stable closed.")
+flags.DEFINE_float("feedback_open_min", 70.0, "Gripper feedback >= open_min means stable open.")
+
+# filtering / diagnostics
+flags.DEFINE_boolean("record_all_raw_steps", False, "Keep all raw env steps after VR starts.")
+flags.DEFINE_boolean("drop_static_converted", False, "Drop zero-action non-terminal converted transitions.")
+flags.DEFINE_float("static_action_eps", 1e-8, "Epsilon for converted static action filtering.")
 flags.DEFINE_boolean(
-    "save_video",
+    "keep_pose_motion_without_intervention",
     False,
-    "Whether to save video during recording.",
+    "If true, keep raw steps with pose motion even when info['intervene_action'] is missing/zero. Default false to preserve old demo filtering.",
 )
+flags.DEFINE_float("pose_static_pos_eps", 1e-5, "Raw step static threshold in meters.")
+flags.DEFINE_float("pose_static_rot_eps", 1e-4, "Raw step static threshold in radians.")
 
-flags.DEFINE_boolean(
-    "manual_confirm_on_success",
-    False,
-    "Whether to manually confirm success even when classifier says succeed=True.",
-)
-
+# final converted demo observation pruning
 flags.DEFINE_string(
     "demo_image_keys",
-    "__config__",
-    (
-        "Comma-separated image keys to save into demos. "
-        "'__config__' means use env_config.image_keys. "
-        "'all' means keep all observation image keys."
-    ),
+    "",
+    "Comma-separated image keys saved into converted training demo. Empty means use env_config.image_keys, e.g. head_rgb,right_wrist_rgb.",
 )
-
 flags.DEFINE_string(
     "demo_extra_obs_keys",
     "state",
-    "Comma-separated non-image observation keys to keep, usually 'state'. Use 'none' to keep none.",
+    "Comma-separated non-image obs keys saved into converted training demo. Default: state.",
 )
-
 flags.DEFINE_boolean(
-    "demo_strict_obs_keys",
+    "strict_demo_obs_keys",
     True,
-    "If True, raise error when requested demo image/state key is missing.",
+    "If true, raise error when final demo image_keys/state are missing during conversion.",
 )
 
-flags.DEFINE_float(
-    "grasp_penalty_value",
-    -0.02,
-    (
-        "Grasp penalty written into demos after action[6] has been rewritten to "
-        "-1/0/+1 event labels. This value should match the learned-gripper penalty."
-    ),
-)
+# =============================================================================
+# 4. print / misc utils
+# =============================================================================
+def print_green(x):
+    print("\033[92m{}\033[00m".format(x))
 
 
-# ==============================================================
-# 夹爪反馈阈值
-# ==============================================================
-CLOSE_MAX = 30.0
-OPEN_MIN = 70.0
+def print_yellow(x):
+    print("\033[93m{}\033[00m".format(x))
 
 
-# ==============================================================
-# action 保存格式约定
-# ==============================================================
-ARM_ACTION_LOW = -1.0
-ARM_ACTION_HIGH = 1.0
+def print_blue(x):
+    print("\033[94m{}\033[00m".format(x))
 
 
-def parse_key_list(raw_value, default_keys=None, allow_all=False):
-    """
-    解析逗号分隔 key 列表。
-
-    - "__config__" -> default_keys
-    - "all"        -> None，表示不裁剪
-    - "none"       -> []
-    """
-    if raw_value is None:
-        return list(default_keys or [])
-
-    value = str(raw_value).strip()
-
-    if value == "__config__":
-        return list(default_keys or [])
-
-    if allow_all and value.lower() == "all":
-        return None
-
-    if value.lower() in ("none", "null", ""):
-        return []
-
-    return [x.strip() for x in value.split(",") if x.strip()]
+def print_red(x):
+    print("\033[91m{}\033[00m".format(x))
 
 
-def get_demo_storage_image_keys():
-    return parse_key_list(
-        FLAGS.demo_image_keys,
-        default_keys=getattr(env_config, "image_keys", []),
-        allow_all=True,
-    )
-
-
-def get_demo_storage_extra_keys():
-    return parse_key_list(
-        FLAGS.demo_extra_obs_keys,
-        default_keys=["state"],
-        allow_all=False,
-    )
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 def ask_success_from_terminal():
@@ -208,221 +264,136 @@ def ask_success_from_terminal():
             print("❌ 输入无效，请输入 1 或 0。")
 
 
-def scalar_float(x, default=0.0):
+def json_safe(obj):
+    if isinstance(obj, dict):
+        return {str(k): json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_safe(x) for x in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.floating, np.integer)):
+        return obj.item()
+    if isinstance(obj, (float, int, str, bool)) or obj is None:
+        return obj
+    return str(obj)
+
+
+def get_config_attr(name, default=None):
+    if hasattr(env_config, name):
+        return getattr(env_config, name)
     try:
-        arr = np.asarray(x).reshape(-1)
-        if arr.size == 0:
-            return float(default)
-        return float(arr[0])
+        cfg = env_config()
+        if hasattr(cfg, name):
+            return getattr(cfg, name)
     except Exception:
-        return float(default)
+        pass
+    return default
 
 
-# ==============================================================
-# observation 裁剪逻辑
-# --------------------------------------------------------------
-# 关键点：
-# - env 内部仍然可以有三路图像，reward classifier 可以用 left_wrist_rgb。
-# - 这里只裁剪“保存到 demo pkl 里的 obs/next_obs”。
-# - 默认保存 env_config.image_keys，也就是 RLPD policy 真实需要的相机。
-# ==============================================================
+def resolve_scales():
+    pos_scale = float(FLAGS.pos_scale) if float(FLAGS.pos_scale) > 0 else float(get_config_attr("POS_SCALE", 0.02))
+    rot_scale = float(FLAGS.rot_scale) if float(FLAGS.rot_scale) > 0 else float(get_config_attr("ROT_SCALE", 0.04))
+    if pos_scale <= 0 or rot_scale <= 0:
+        raise ValueError(f"POS_SCALE/ROT_SCALE 必须 >0, got pos_scale={pos_scale}, rot_scale={rot_scale}")
+    return pos_scale, rot_scale
 
-def _get_obs_value(obs, key):
+
+# =============================================================================
+# 4.1 final demo observation pruning
+# =============================================================================
+def _split_csv_keys(s):
+    if s is None:
+        return []
+    if isinstance(s, (list, tuple)):
+        return [str(x).strip() for x in s if str(x).strip()]
+    return [x.strip() for x in str(s).split(",") if x.strip()]
+
+
+def get_policy_image_keys_for_demo():
     """
-    支持两种 observation 结构：
-    1. obs[key]
-    2. obs["images"][key]
+    最终 converted demo 保存哪些图像。
+
+    旧 demo 保存逻辑：按 RLPD policy 的 image_keys 保存，而不是按 ENV_IMAGE_KEYS 保存。
+    ENV_IMAGE_KEYS 只是环境/相机里可用图像，classifier_keys 只是奖励分类器输入。
     """
+    override = _split_csv_keys(getattr(FLAGS, "demo_image_keys", ""))
+    if override:
+        return override
+
+    keys = get_config_attr("image_keys", None)
+    if keys is None:
+        keys = ["head_rgb", "right_wrist_rgb"]
+    return list(keys)
+
+
+def get_extra_obs_keys_for_demo():
+    keys = _split_csv_keys(getattr(FLAGS, "demo_extra_obs_keys", "state"))
+    return keys if keys else ["state"]
+
+
+def _get_obs_value_by_key(obs, key):
+    if obs is None or not isinstance(obs, dict):
+        raise KeyError(f"obs is not dict, cannot get key={key}, type={type(obs)}")
+
     if key in obs:
         return obs[key]
 
-    if "images" in obs and isinstance(obs["images"], dict) and key in obs["images"]:
-        return obs["images"][key]
+    images = obs.get("images", None)
+    if isinstance(images, dict) and key in images:
+        return images[key]
 
-    raise KeyError(
-        f"observation 中找不到 key='{key}'。当前 obs keys={list(obs.keys())}"
-    )
+    raise KeyError(f"observation 中找不到 key={key}; available={list(obs.keys())}")
 
 
-def prune_obs_for_demo_storage(
-    obs,
-    image_keys,
-    extra_obs_keys,
-    strict=True,
-):
+def prune_obs_for_converted_demo(obs, image_keys=None, extra_obs_keys=None, strict=None):
     """
-    保存 demos 前裁剪 observation。
+    只用于最终 converted training pkl。
 
-    image_keys=None 表示保留完整 obs。
-    image_keys=[...] 表示只保留这些图像 key。
-    extra_obs_keys 通常保留 ["state"]。
+    raw absolute pkl 继续保存完整 ENV_IMAGE_KEYS，方便 classifier/诊断。
+    converted demo pkl 必须按旧 demo 逻辑，只保存 policy image_keys + state。
     """
-    if obs is None:
-        return obs
-
-    if not isinstance(obs, dict):
-        return obs
-
     if image_keys is None:
-        return copy.deepcopy(obs)
+        image_keys = get_policy_image_keys_for_demo()
+    if extra_obs_keys is None:
+        extra_obs_keys = get_extra_obs_keys_for_demo()
+    if strict is None:
+        strict = bool(FLAGS.strict_demo_obs_keys)
 
     keep = {}
-
-    for key in image_keys:
+    for key in list(image_keys) + list(extra_obs_keys):
         try:
-            keep[key] = _get_obs_value(obs, key)
-        except KeyError:
+            keep[key] = copy.deepcopy(_get_obs_value_by_key(obs, key))
+        except KeyError as e:
             if strict:
                 raise
-            print(f"⚠️ demo 保存时跳过缺失图像 key={key}")
-
-    for key in extra_obs_keys:
-        try:
-            keep[key] = _get_obs_value(obs, key)
-        except KeyError:
-            if strict:
-                raise
-            print(f"⚠️ demo 保存时跳过缺失 extra obs key={key}")
-
+            print_yellow(f"⚠️ converted demo pruning skipped missing obs key={key}: {e}")
     return keep
 
 
-def prune_transition_obs_for_demo_storage(
-    trans,
-    image_keys,
-    extra_obs_keys,
-    strict=True,
-):
-    """
-    保存前裁剪 transition 里的 observations / next_observations。
-    """
-    trans = copy.deepcopy(trans)
-
-    if "observations" in trans:
-        trans["observations"] = prune_obs_for_demo_storage(
-            trans["observations"],
-            image_keys=image_keys,
-            extra_obs_keys=extra_obs_keys,
-            strict=strict,
-        )
-
-    if "next_observations" in trans:
-        trans["next_observations"] = prune_obs_for_demo_storage(
-            trans["next_observations"],
-            image_keys=image_keys,
-            extra_obs_keys=extra_obs_keys,
-            strict=strict,
-        )
-
-    return trans
-
-
-def print_obs_keys_summary(transitions, name="demos"):
+def summarize_obs_keys_for_transitions(transitions, name):
     if not transitions:
-        print(f"⚠️ {name}: empty transitions")
+        print_yellow(f"⚠️ {name}: no transitions to summarize obs keys")
         return
-
     obs = transitions[0].get("observations", {})
     next_obs = transitions[0].get("next_observations", {})
-
-    print("\n===== 保存 observation keys 检查 =====")
+    print_blue("\n===== converted demo obs pruning check =====")
     print(f"{name} observations keys     : {list(obs.keys()) if isinstance(obs, dict) else type(obs)}")
     print(f"{name} next_observations keys: {list(next_obs.keys()) if isinstance(next_obs, dict) else type(next_obs)}")
+    print(f"expected policy image_keys   : {get_policy_image_keys_for_demo()}")
+    print(f"expected extra obs keys      : {get_extra_obs_keys_for_demo()}")
 
-
-# ==============================================================
-# action 清洗逻辑
-# ==============================================================
-
-def sanitize_single_arm_action_for_storage(
-    action,
-    quantize_gripper=True,
-    source="unknown",
-):
-    """
-    统一所有要写入 demos / replay buffer 的单臂 action 格式。
-
-    目标格式：
-      action.shape = (7,)
-      action[:6]  = clip 到 [-1, 1]
-      action[6]   = -1 / 0 / +1，如果 quantize_gripper=True
-
-    注意：
-    - 这里不要依赖 env.action_space.low/high。
-    - 这个函数是幂等的，重复调用不会把 action 越变越小。
-    """
-    a = np.asarray(action, dtype=np.float32).reshape(-1).copy()
-
-    if a.shape[0] != 7:
-        raise ValueError(
-            f"[sanitize_single_arm_action_for_storage] 单臂任务期望 7 维 action，"
-            f"但 source={source} 得到 shape={a.shape}, value={a}"
-        )
-
-    before = a.copy()
-
-    # 前 6 维必须是 RLPD 归一化动作
-    a[:6] = np.clip(a[:6], ARM_ACTION_LOW, ARM_ACTION_HIGH)
-
-    # gripper 维保存为三值事件
-    if quantize_gripper:
-        g = float(a[6])
-        if g <= -0.5:
-            a[6] = -1.0
-        elif g >= 0.5:
-            a[6] = 1.0
-        else:
-            a[6] = 0.0
-    else:
-        a[6] = np.clip(a[6], ARM_ACTION_LOW, ARM_ACTION_HIGH)
-
-    if np.any(np.abs(before[:6]) > 1.0001):
-        print(
-            f"⚠️ action 前6维超出 [-1,1]，已在保存前 clip。"
-            f" source={source}, before={np.round(before, 4).tolist()}, "
-            f"after={np.round(a, 4).tolist()}"
-        )
-
-    return a.astype(np.float32)
-
-
-def sanitize_transition_for_storage(trans):
-    """
-    保存前最后一道动作保险。
-    """
-    trans = copy.deepcopy(trans)
-    trans["actions"] = sanitize_single_arm_action_for_storage(
-        trans["actions"],
-        quantize_gripper=True,
-        source="final_transition_sanitize",
-    )
-    return trans
-
-
-# ==============================================================
-# gripper 三值重写逻辑
-# ==============================================================
-
+# =============================================================================
+# 5. gripper helpers
+# =============================================================================
 def extract_gripper_feedback(obs):
-    """
-    从 obs["state"] 中提取夹爪反馈量程。
-    兼容：
-    1) state 是 dict，含 right_gripper / gripper
-    2) state 是 ndarray，单臂常见最后一维为 gripper
-    """
+    """从 obs['state'] 提取夹爪反馈。单臂常见 state 最后一维是 gripper。"""
     if obs is None or "state" not in obs:
         return None
 
     state = obs["state"]
 
     if isinstance(state, dict):
-        for key in [
-            "right_gripper",
-            "left_gripper",
-            "gripper",
-            "state/right_gripper",
-            "state/left_gripper",
-        ]:
+        for key in ["right_gripper", "left_gripper", "gripper", "state/right_gripper", "state/left_gripper"]:
             if key in state:
                 arr = np.asarray(state[key]).reshape(-1)
                 if arr.size > 0:
@@ -433,7 +404,6 @@ def extract_gripper_feedback(obs):
                 arr = np.asarray(val).reshape(-1)
                 if arr.size > 0:
                     return float(arr[-1])
-
         return None
 
     arr = np.asarray(state)
@@ -442,626 +412,1137 @@ def extract_gripper_feedback(obs):
     arr = arr.reshape(-1)
     if arr.size == 0:
         return None
-
     return float(arr[-1])
 
 
-def infer_stable_gripper_state_from_feedback(
-    gripper_feedback,
-    prev_state,
-    close_max=CLOSE_MAX,
-    open_min=OPEN_MIN,
-):
-    """
-    将反馈量程映射为稳定夹爪状态：
-      -1 -> 当前稳定为闭合
-      +1 -> 当前稳定为张开
-      中间区 -> 保持上一稳定状态
-    """
-    if gripper_feedback is None:
+def stable_gripper_from_feedback(feedback, prev_state=None):
+    """返回稳定夹爪状态：-1 closed, +1 open；中间区保持 prev_state。"""
+    if feedback is None:
         return prev_state
-
-    x = float(gripper_feedback)
-
-    if x <= close_max:
+    x = float(feedback)
+    if x <= float(FLAGS.feedback_close_max):
         return -1
-    if x >= open_min:
+    if x >= float(FLAGS.feedback_open_min):
         return +1
-
     return prev_state
 
 
-def rewrite_gripper_action_to_official_style(
-    action,
-    obs,
-    next_obs,
-    prev_stable_state,
-):
-    """
-    把夹爪最后一维改写成官网风格三值事件：
-      -1 = close event
-       0 = hold / no-op
-      +1 = open event
+def gripper_event_from_feedback(prev_feedback, next_feedback, prev_stable_state):
+    """生成事件标签：open->closed: -1, closed->open: +1, otherwise 0。"""
+    prev_state = stable_gripper_from_feedback(prev_feedback, prev_stable_state)
+    if prev_state is None:
+        prev_state = +1  # reset 后默认开爪
+    next_state = stable_gripper_from_feedback(next_feedback, prev_state)
 
-    注意：
-    - 这里不负责前 6 维 clip。
-    - 前 6 维 clip 在 sanitize_single_arm_action_for_storage() 中完成。
-    """
-    action = np.asarray(action, dtype=np.float32).reshape(-1).copy()
-
-    if action.shape[0] != 7:
-        return action, prev_stable_state
-
-    prev_feedback = extract_gripper_feedback(obs)
-    next_feedback = extract_gripper_feedback(next_obs)
-
-    prev_state = infer_stable_gripper_state_from_feedback(
-        prev_feedback,
-        prev_stable_state,
-    )
-    next_state = infer_stable_gripper_state_from_feedback(
-        next_feedback,
-        prev_state,
-    )
-
-    gripper_event = 0.0
-    if prev_state is not None and next_state is not None:
-        if prev_state == +1 and next_state == -1:
-            gripper_event = -1.0
-        elif prev_state == -1 and next_state == +1:
-            gripper_event = +1.0
-        else:
-            gripper_event = 0.0
-    else:
-        gripper_event = 0.0
-
-    action[6] = np.float32(gripper_event)
-    return action.astype(np.float32), next_state
+    if prev_state == +1 and next_state == -1:
+        return -1.0, next_state, prev_state
+    if prev_state == -1 and next_state == +1:
+        return +1.0, next_state, prev_state
+    return 0.0, next_state, prev_state
 
 
-# ==============================================================
-# grasp_penalty 同步逻辑
-# --------------------------------------------------------------
-# 关键修改：
-# env.step() 内部的 SingleGripperPenaltyWrapper 可能在 action[6]
-# 被重写成三值事件之前就计算了 info["grasp_penalty"]。
-#
-# 因此最终保存 demos 前，必须按“最终保存的 action[6]”
-# 重新计算 grasp_penalty，保证：
-#   hold(0)       -> 0
-#   close(-1)    -> FLAGS.grasp_penalty_value
-#   open(+1)     -> FLAGS.grasp_penalty_value
-#
-# 这样不会再出现：
-#   action[6] = hold(0)
-#   grasp_penalty = -0.02
-# 的错误组合。
-# ==============================================================
+def describe_gripper_event(x):
+    x = float(x)
+    if x <= -0.5:
+        return "close(-1)"
+    if x >= 0.5:
+        return "open(+1)"
+    return "hold(0)"
 
-def recompute_grasp_penalty_from_stored_action(action, penalty_value):
-    """
-    根据最终保存的 action[6] 三值事件标签重算 grasp_penalty。
 
-    action[6]:
-      -1 = close event -> penalty_value
-       0 = hold        -> 0
-      +1 = open event  -> penalty_value
-    """
+def recompute_grasp_penalty_from_action(action):
     a = np.asarray(action, dtype=np.float32).reshape(-1)
-
     if a.shape[0] != 7:
         return 0.0
+    return float(FLAGS.grasp_penalty_value) if abs(float(a[6])) > 0.5 else 0.0
 
-    g = float(a[6])
+# =============================================================================
+# 6. quaternion / pose helpers
+# =============================================================================
+def normalize_quat(q):
+    q = np.asarray(q, dtype=np.float64).reshape(4)
+    n = np.linalg.norm(q)
+    if n < 1e-12:
+        return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    q = q / n
+    if q[3] < 0:
+        q = -q
+    return q
 
-    if g <= -0.5:
-        return float(penalty_value)
 
-    if g >= 0.5:
-        return float(penalty_value)
-
-    return 0.0
+def quat_inv(q):
+    q = normalize_quat(q)
+    return np.array([-q[0], -q[1], -q[2], q[3]], dtype=np.float64)
 
 
-def sync_grasp_penalty_with_stored_action(trans, penalty_value):
+def quat_mul(q1, q2):
+    x1, y1, z1, w1 = normalize_quat(q1)
+    x2, y2, z2, w2 = normalize_quat(q2)
+    return normalize_quat(np.array([
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+    ], dtype=np.float64))
+
+
+def quat_to_rotvec(q):
+    q = normalize_quat(q)
+    xyz = q[:3]
+    w = float(q[3])
+    if w < 0:
+        q = -q
+        xyz = q[:3]
+        w = float(q[3])
+    sin_half = np.linalg.norm(xyz)
+    if sin_half < 1e-12:
+        return np.zeros(3, dtype=np.float64)
+    angle = 2.0 * math.atan2(sin_half, w)
+    if angle > math.pi:
+        angle -= 2.0 * math.pi
+    axis = xyz / sin_half
+    return axis * angle
+
+
+def pose_to_array(pose_rec):
+    if pose_rec is None:
+        return None
+    if isinstance(pose_rec, dict):
+        if "pose" in pose_rec:
+            return pose_to_array(pose_rec["pose"])
+        keys = ["x", "y", "z", "qx", "qy", "qz", "qw"]
+        if all(k in pose_rec for k in keys):
+            arr = np.asarray([pose_rec[k] for k in keys], dtype=np.float64)
+            arr[3:7] = normalize_quat(arr[3:7])
+            return arr
+        return None
+    arr = np.asarray(pose_rec, dtype=np.float64).reshape(-1)
+    if arr.size != 7:
+        return None
+    arr = arr.copy()
+    arr[3:7] = normalize_quat(arr[3:7])
+    return arr
+
+
+def pose_delta_to_components(pose_before, pose_after):
+    p0 = pose_to_array(pose_before)
+    p1 = pose_to_array(pose_after)
+    if p0 is None or p1 is None:
+        return None, None
+
+    pos0, q0 = p0[:3], normalize_quat(p0[3:7])
+    pos1, q1 = p1[:3], normalize_quat(p1[3:7])
+    if np.dot(q0, q1) < 0:
+        q1 = -q1
+
+    delta_pos = pos1 - pos0
+    q_delta = quat_mul(q1, quat_inv(q0))
+    rotvec = quat_to_rotvec(q_delta)
+    return delta_pos.astype(np.float64), rotvec.astype(np.float64)
+
+
+def normalized_action6_from_pose_delta(pose_before, pose_after, pos_scale, rot_scale):
+    delta_pos, rotvec = pose_delta_to_components(pose_before, pose_after)
+    if delta_pos is None:
+        return None, None
+
+    raw = np.zeros(6, dtype=np.float64)
+    raw[:3] = delta_pos / float(pos_scale)
+    raw[3:6] = rotvec / float(rot_scale)
+    clipped = np.clip(raw, -1.0, 1.0) if FLAGS.clip_action else raw.copy()
+
+    extra = {
+        "delta_pos_m": delta_pos,
+        "delta_rotvec_rad": rotvec,
+        "raw_normalized_action6": raw,
+        "clipped_action6": clipped,
+        "was_clipped": bool(np.any(np.abs(raw) > 1.0 + 1e-8)),
+    }
+    return clipped.astype(np.float32), extra
+
+
+def pose_motion_norm(pose_before, pose_after):
+    delta_pos, rotvec = pose_delta_to_components(pose_before, pose_after)
+    if delta_pos is None:
+        return None, None
+    return float(np.linalg.norm(delta_pos)), float(np.linalg.norm(rotvec))
+
+# =============================================================================
+# 7. ROS subscriber node: pose + optional control mode
+# =============================================================================
+def stamp_to_float(stamp):
+    try:
+        return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+    except Exception:
+        return None
+
+
+def pose_stamped_to_record(msg):
+    if msg is None:
+        return None
+    return {
+        "pose": np.asarray([
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z,
+            msg.pose.orientation.x,
+            msg.pose.orientation.y,
+            msg.pose.orientation.z,
+            msg.pose.orientation.w,
+        ], dtype=np.float64),
+        "frame_id": str(msg.header.frame_id),
+        "stamp": {
+            "sec": int(msg.header.stamp.sec),
+            "nanosec": int(msg.header.stamp.nanosec),
+            "stamp_float": stamp_to_float(msg.header.stamp),
+        },
+        "recv_time": time.time(),
+    }
+
+
+def int_msg_to_value(msg):
+    try:
+        return int(msg.data)
+    except Exception:
+        return None
+
+
+STD_INT_MSG_TYPES = {
+    "std_msgs/msg/Int8": Int8,
+    "std_msgs/msg/Int16": Int16,
+    "std_msgs/msg/Int32": Int32,
+    "std_msgs/msg/UInt8": UInt8,
+    "std_msgs/msg/UInt16": UInt16,
+    "std_msgs/msg/UInt32": UInt32,
+}
+
+
+class RecorderRosNode(Node):
+    def __init__(self, feedback_topic, target_topic, control_mode_topic):
+        super().__init__("abs_pose_demo_recorder_node")
+        self._lock = threading.Lock()
+
+        self.feedback_pose = None
+        self.target_pose = None
+        self.feedback_count = 0
+        self.target_count = 0
+
+        self.control_mode_topic = control_mode_topic
+        self.control_mode = None
+        self.control_mode_count = 0
+        self.control_mode_type = None
+
+        pose_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=100,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(PoseStamped, feedback_topic, self._feedback_cb, pose_qos)
+        self.create_subscription(PoseStamped, target_topic, self._target_cb, pose_qos)
+
+        if control_mode_topic:
+            self._try_create_control_mode_subscription(control_mode_topic)
+
+    def _try_create_control_mode_subscription(self, topic):
+        # 尝试根据 ROS graph 里的 topic type 创建订阅。
+        msg_cls = None
+        topic_type = None
+        try:
+            for name, types in self.get_topic_names_and_types():
+                if name == topic and len(types) > 0:
+                    topic_type = types[0]
+                    msg_cls = STD_INT_MSG_TYPES.get(topic_type)
+                    break
+        except Exception:
+            pass
+
+        # 如果 graph 还没发现 topic，默认试 Int32。
+        if msg_cls is None and topic_type is None:
+            topic_type = "std_msgs/msg/Int32(default)"
+            msg_cls = Int32
+
+        if msg_cls is None:
+            print_yellow(f"⚠️ control_mode_topic={topic} 类型 {topic_type} 暂不支持；将不用 ROS topic 自动检测 VR mode。")
+            return
+
+        qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=20,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(msg_cls, topic, self._control_mode_cb, qos)
+        self.control_mode_type = topic_type
+        print_green(f"✅ control mode subscriber: {topic}, type={topic_type}")
+
+    def _feedback_cb(self, msg):
+        rec = pose_stamped_to_record(msg)
+        with self._lock:
+            self.feedback_pose = rec
+            self.feedback_count += 1
+
+    def _target_cb(self, msg):
+        rec = pose_stamped_to_record(msg)
+        with self._lock:
+            self.target_pose = rec
+            self.target_count += 1
+
+    def _control_mode_cb(self, msg):
+        value = int_msg_to_value(msg)
+        with self._lock:
+            self.control_mode = value
+            self.control_mode_count += 1
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "feedback": copy.deepcopy(self.feedback_pose),
+                "target": copy.deepcopy(self.target_pose),
+                "feedback_count": int(self.feedback_count),
+                "target_count": int(self.target_count),
+                "control_mode": self.control_mode,
+                "control_mode_count": int(self.control_mode_count),
+                "control_mode_type": self.control_mode_type,
+                "snapshot_time": time.time(),
+            }
+
+
+class RosRecorderSubscriber:
+    def __init__(self, feedback_topic, target_topic, control_mode_topic):
+        if rclpy is None:
+            raise RuntimeError(f"无法导入 ROS2 rclpy / PoseStamped: {_ROS_IMPORT_ERROR!r}")
+        self.feedback_topic = feedback_topic
+        self.target_topic = target_topic
+        self.control_mode_topic = control_mode_topic
+        self.node = None
+        self.thread = None
+        self._started = False
+
+    def start(self):
+        if not rclpy.ok():
+            rclpy.init(args=None)
+        self.node = RecorderRosNode(self.feedback_topic, self.target_topic, self.control_mode_topic)
+        self.thread = threading.Thread(target=rclpy.spin, args=(self.node,), daemon=True)
+        self.thread.start()
+        self._started = True
+        print_green("✅ ROS2 subscribers started:")
+        print_green(f"   feedback pose: {self.feedback_topic}")
+        print_green(f"   target pose  : {self.target_topic}")
+        if self.control_mode_topic:
+            print_green(f"   control mode : {self.control_mode_topic}")
+
+    def stop(self):
+        if not self._started:
+            return
+        try:
+            if self.node is not None:
+                self.node.destroy_node()
+        except Exception as e:
+            print_yellow(f"⚠️ destroy ROS node failed: {e!r}")
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+        self._started = False
+
+    def snapshot(self):
+        if self.node is None:
+            return None
+        return self.node.snapshot()
+
+    def wait_initial_pose_messages(self, timeout_sec):
+        t0 = time.time()
+        while time.time() - t0 < timeout_sec:
+            snap = self.snapshot()
+            if snap and snap.get("feedback") is not None and snap.get("target") is not None:
+                print_green(f"✅ 已收到初始 pose: feedback_count={snap['feedback_count']}, target_count={snap['target_count']}")
+                return True
+            time.sleep(0.05)
+        snap = self.snapshot() or {}
+        print_yellow(
+            "⚠️ 等待初始 pose 超时: "
+            f"feedback_received={snap.get('feedback') is not None}, "
+            f"target_received={snap.get('target') is not None}, "
+            f"feedback_count={snap.get('feedback_count', 0)}, "
+            f"target_count={snap.get('target_count', 0)}"
+        )
+        return False
+
+# =============================================================================
+# 8. wait VR takeover without env.step
+# =============================================================================
+def try_read_control_mode_from_env(env):
+    """尽量从 env / wrapper 属性读 control_mode；不调用 env.step。
+    兼容旧 env 的 script_control_enabled：True=Mode2 脚本控制，False=Mode0 VR。
     """
-    将 grasp_penalty 与最终保存的 action[6] 三值事件标签同步。
+    # 先兼容你之前 env 里的 script_control_enabled：False 表示已经回到 VR Mode0。
+    for name in ["script_control_enabled"]:
+        try:
+            if hasattr(env, "get_wrapper_attr"):
+                value = env.get_wrapper_attr(name)
+                if value is not None:
+                    return (2 if bool(value) else 0), f"env.get_wrapper_attr({name})"
+        except Exception:
+            pass
+    try:
+        base = getattr(env, "unwrapped", None)
+        if base is not None and hasattr(base, "script_control_enabled"):
+            value = getattr(base, "script_control_enabled")
+            if value is not None:
+                return (2 if bool(value) else 0), "env.unwrapped.script_control_enabled"
+    except Exception:
+        pass
 
-    保存策略：
-      1. trans["grasp_penalty"] 写入重算后的 penalty，方便 RLPD 直接读取。
-      2. trans["infos"]["grasp_penalty"] 也写入重算后的 penalty，方便可视化脚本读取。
-      3. 如果 env 原始 info 里已经有 grasp_penalty，则保留为 env_grasp_penalty_raw，方便调试。
+    # get_wrapper_attr 是 gymnasium 推荐接口。
+    for name in ["control_mode", "current_control_mode", "mode"]:
+        try:
+            if hasattr(env, "get_wrapper_attr"):
+                value = env.get_wrapper_attr(name)
+                if value is not None:
+                    return int(value), f"env.get_wrapper_attr({name})"
+        except Exception:
+            pass
+
+    objs = [env]
+    for attr in ["unwrapped", "env"]:
+        try:
+            obj = getattr(env, attr, None)
+            if obj is not None and obj not in objs:
+                objs.append(obj)
+        except Exception:
+            pass
+
+    for obj in objs:
+        for name in ["control_mode", "current_control_mode", "mode"]:
+            try:
+                if hasattr(obj, name):
+                    value = getattr(obj, name)
+                    if value is not None and not callable(value):
+                        return int(value), f"{type(obj).__name__}.{name}"
+            except Exception:
+                pass
+        for name in ["get_control_mode", "get_current_control_mode"]:
+            try:
+                fn = getattr(obj, name, None)
+                if callable(fn):
+                    value = fn()
+                    if value is not None:
+                        return int(value), f"{type(obj).__name__}.{name}()"
+            except Exception:
+                pass
+    return None, None
+
+
+def wait_for_vr_takeover_no_env_step(env, ros_sub, reason):
     """
-    trans = copy.deepcopy(trans)
-
-    if "actions" not in trans:
-        return trans
-
-    expected_penalty = recompute_grasp_penalty_from_stored_action(
-        trans["actions"],
-        penalty_value=penalty_value,
-    )
-
-    infos = trans.get("infos", {})
-    if not isinstance(infos, dict):
-        infos = {}
-
-    if "grasp_penalty" in infos:
-        infos["env_grasp_penalty_raw"] = scalar_float(infos["grasp_penalty"], 0.0)
-
-    if "grasp_penalty" in trans:
-        infos["top_level_grasp_penalty_raw"] = scalar_float(trans["grasp_penalty"], 0.0)
-
-    infos["grasp_penalty"] = float(expected_penalty)
-    infos["grasp_penalty_source"] = "recomputed_from_final_stored_action"
-
-    trans["infos"] = infos
-    trans["grasp_penalty"] = float(expected_penalty)
-
-    return trans
-
-
-def extract_saved_grasp_penalty(trans):
-    if "grasp_penalty" in trans:
-        return scalar_float(trans["grasp_penalty"], 0.0)
-
-    infos = trans.get("infos", {})
-    if isinstance(infos, dict) and "grasp_penalty" in infos:
-        return scalar_float(infos["grasp_penalty"], 0.0)
-
-    return None
-
-
-# ==============================================================
-# 其他辅助
-# ==============================================================
-
-def build_safe_idle_action(action_shape):
+    reset 后等待 VR 接管。
+    这里绝对不调用 env.step，也不发送 zero action。
     """
-    默认发给机器人的“安全空动作”：
-    - 前 6 维全 0，不继续推动末端
-    - 最后一维给安全夹爪保持值
+    print_yellow("\n⏳ reset 后等待 VR 接管：此阶段不调用 env.step，不发送 zero action，不记录 reset 等待帧。")
+    print_yellow(f"   reason={reason}, expected_vr_control_mode={FLAGS.vr_control_mode_value}")
 
-    注意：
-    这个 action 是给 env.step() 执行的，不是最终保存到 demos 的 action。
-    保存到 demos 的 action 会另外经过 sanitize。
+    warned_manual = False
+    last_print_t = 0.0
+
+    while True:
+        # 1) 优先读 ROS control_mode topic
+        snap = ros_sub.snapshot() if ros_sub is not None else None
+        if snap is not None and snap.get("control_mode") is not None:
+            mode = int(snap["control_mode"])
+            if mode == int(FLAGS.vr_control_mode_value):
+                print_green(f"🎮 检测到 VR control_mode={mode}，开始记录/执行 env.step。")
+                return
+
+        # 2) 再尝试从 env 属性读，不调用 step
+        mode, source = try_read_control_mode_from_env(env)
+        if mode is not None:
+            if mode == int(FLAGS.vr_control_mode_value):
+                print_green(f"🎮 检测到 VR control_mode={mode} from {source}，开始记录/执行 env.step。")
+                return
+
+        # 3) 没有可用自动检测时，人工确认
+        if (snap is None or snap.get("control_mode") is None) and mode is None and FLAGS.manual_start_if_no_control_mode:
+            if not warned_manual:
+                print_yellow("⚠️ 当前没有可读的 control_mode。")
+                print_yellow("   请先切到 VR 控制模式；确认已经切好后按 Enter 开始。")
+                input("按 Enter 开始本条 demo 的 env.step 录制...")
+                return
+            warned_manual = True
+
+        now = time.time()
+        if now - last_print_t > 2.0:
+            cm = None if snap is None else snap.get("control_mode")
+            cc = 0 if snap is None else snap.get("control_mode_count", 0)
+            print(f"   waiting VR... ros_control_mode={cm}, count={cc}, env_mode={mode}")
+            last_print_t = now
+        time.sleep(float(FLAGS.wait_vr_poll_sec))
+
+# =============================================================================
+# 9. raw recording helpers
+# =============================================================================
+def make_raw_step(obs, next_obs, reward, done, truncated, info, raw_actions, before_pose_snapshot, after_pose_snapshot, episode_step, wall_dt):
+    episode_end = bool(done or truncated)
+    raw_actions = np.asarray(raw_actions, dtype=np.float32).reshape(-1)
+    return {
+        "observations": copy.deepcopy(obs),
+        "next_observations": copy.deepcopy(next_obs),
+        "reward": float(reward),
+        "done": bool(done),
+        "truncated": bool(truncated),
+        "episode_end": bool(episode_end),
+        "mask": 1.0 - float(episode_end),
+        "infos": copy.deepcopy(info),
+        "raw_intervene_action": raw_actions.astype(np.float32),
+        "has_intervene_action": bool("intervene_action" in info),
+        "episode_step": int(episode_step),
+        "record_time": time.time(),
+        "env_step_wall_dt": float(wall_dt),
+        "gripper_feedback_before": extract_gripper_feedback(obs),
+        "gripper_feedback_after": extract_gripper_feedback(next_obs),
+        "poses": {
+            "feedback": {
+                "before": copy.deepcopy((before_pose_snapshot or {}).get("feedback")),
+                "after": copy.deepcopy((after_pose_snapshot or {}).get("feedback")),
+            },
+            "target": {
+                "before": copy.deepcopy((before_pose_snapshot or {}).get("target")),
+                "after": copy.deepcopy((after_pose_snapshot or {}).get("target")),
+            },
+        },
+        "pose_counts": {
+            "before_feedback_count": int((before_pose_snapshot or {}).get("feedback_count", 0)),
+            "before_target_count": int((before_pose_snapshot or {}).get("target_count", 0)),
+            "after_feedback_count": int((after_pose_snapshot or {}).get("feedback_count", 0)),
+            "after_target_count": int((after_pose_snapshot or {}).get("target_count", 0)),
+        },
+    }
+
+
+def should_keep_raw_step_like_old_demo(raw_step, raw_actions, episode_end):
     """
-    safe_idle_action = np.zeros(action_shape, dtype=np.float32)
-    if safe_idle_action.shape[0] == 7:
-        safe_idle_action[6] = 80.0
-    return safe_idle_action
-
-
-def print_trajectory_action_stats(trajectory):
-    if len(trajectory) == 0:
-        return
-
-    acts = np.asarray([t["actions"] for t in trajectory], dtype=np.float32)
-    if acts.ndim != 2 or acts.shape[1] != 7:
-        print(f"⚠️ 无法统计 action，acts.shape={acts.shape}")
-        return
-
-    arm_absmax = float(np.max(np.abs(acts[:, :6])))
-    arm_min = float(np.min(acts[:, :6]))
-    arm_max = float(np.max(acts[:, :6]))
-
-    g = acts[:, 6]
-    n_close = int(np.sum(g < -0.5))
-    n_open = int(np.sum(g > 0.5))
-    n_hold = int(np.sum(np.abs(g) <= 0.5))
-
-    penalties = []
-    for t in trajectory:
-        p = extract_saved_grasp_penalty(t)
-        if p is not None:
-            penalties.append(float(p))
-
-    print(f"📦 本条完整轨迹长度: {len(trajectory)}")
-    print(f"🦾 arm action min={arm_min:.4f}, max={arm_max:.4f}, absmax={arm_absmax:.4f}")
-    print(f"🤏 gripper统计: close={n_close}, hold={n_hold}, open={n_open}")
-
-    if penalties:
-        penalties_np = np.asarray(penalties, dtype=np.float32)
-        nonzero = int(np.sum(np.abs(penalties_np) > 1e-8))
-        vals, cnts = np.unique(np.round(penalties_np, 8), return_counts=True)
-        dist = {float(v): int(c) for v, c in zip(vals, cnts)}
-        print(f"🧲 grasp_penalty统计: nonzero={nonzero}, sum={float(np.sum(penalties_np)):.6f}, dist={dist}")
-
-    if arm_absmax > 1.0001:
-        print("❌ 警告：本条轨迹仍有 action[:6] 超出 [-1,1]，请立刻停止并检查。")
-    else:
-        print("✅ 本条轨迹 action[:6] 已全部在 [-1,1] 内。")
-
-
-def finalize_transition_for_demo_storage(
-    trans,
-    demo_image_keys,
-    demo_extra_obs_keys,
-):
+    保留原 demo 脚本的核心过滤逻辑：
+    - raw action 非零才记录；
+    - reset 等待阶段不会进到这里；
+    - 额外保留终止帧 / 夹爪反馈变化帧，保证 reward/done 和 gripper event 不丢。
     """
-    最终保存前统一处理：
-    1. action 清洗
-    2. grasp_penalty 按最终 action[6] 重算
-    3. obs / next_obs 按 demo_image_keys 裁剪
-    """
-    trans = sanitize_transition_for_storage(trans)
+    if FLAGS.record_all_raw_steps:
+        return True
 
-    # 关键：必须在 action 已经是最终保存格式之后重算 penalty。
-    trans = sync_grasp_penalty_with_stored_action(
-        trans,
-        penalty_value=FLAGS.grasp_penalty_value,
-    )
+    raw_actions = np.asarray(raw_actions, dtype=np.float32).reshape(-1)
+    is_static = np.allclose(raw_actions, 0.0, atol=1e-8)
+    if not is_static:
+        return True
 
-    trans = prune_transition_obs_for_demo_storage(
-        trans,
-        image_keys=demo_image_keys,
-        extra_obs_keys=demo_extra_obs_keys,
-        strict=FLAGS.demo_strict_obs_keys,
-    )
-    return trans
+    # 为了避免成功帧丢失，终止帧保留。
+    if episode_end or abs(float(raw_step.get("reward", 0.0))) > 1e-12:
+        return True
+
+    # 夹爪反馈变化帧保留，避免 close/open 事件丢失。
+    gb = raw_step.get("gripper_feedback_before", None)
+    ga = raw_step.get("gripper_feedback_after", None)
+    if gb is not None and ga is not None and abs(float(ga) - float(gb)) > 1e-6:
+        return True
+
+    if FLAGS.keep_pose_motion_without_intervention:
+        for source in ("feedback", "target"):
+            p = raw_step.get("poses", {}).get(source, {})
+            pnorm, rnorm = pose_motion_norm(p.get("before"), p.get("after"))
+            if pnorm is not None and pnorm > float(FLAGS.pose_static_pos_eps):
+                return True
+            if rnorm is not None and rnorm > float(FLAGS.pose_static_rot_eps):
+                return True
+
+    return False
 
 
-# ==============================================================
-# 主函数
-# ==============================================================
+def record_raw_absolute_demos():
+    print_blue(f"🚀 开始录制 raw absolute demos：{FLAGS.exp_name}")
+    print_blue("📌 保留旧逻辑：reset 后先等待 VR mode；等待阶段不 env.step，不发 zero，不记录。")
+    print_blue("📌 新增：记录 feedback pose / target pose，结束后离线转换为标准相对增量 demo。\n")
 
-def main(_):
-    demo_image_keys = get_demo_storage_image_keys()
-    demo_extra_obs_keys = get_demo_storage_extra_keys()
+    ros_sub = RosRecorderSubscriber(FLAGS.feedback_pose_topic, FLAGS.target_pose_topic, FLAGS.control_mode_topic)
+    ros_sub.start()
+    ros_sub.wait_initial_pose_messages(float(FLAGS.wait_initial_pose_sec))
 
-    print(f"🚀 开始录制专家数据：{FLAGS.exp_name}")
-    print(f"🧠 reward classifier: {'开启' if FLAGS.classifier else '关闭'}")
-    print("📌 当前脚本策略：")
-    print("   - classifier=True 时：成功由 reward ckpt 在成功瞬间触发。")
-    print("   - max_episode_steps 只统计【开始记录后】的步数，reset/等待帧不计入。")
-    print("   - reset 后不会立刻记录，必须等第一次 VR 接管 intervene_action 后才开始记录。")
-    print("   - 全程轨迹完整保留，不删除演示开始后的静止帧。")
-    print("   - 保存到 pkl 的 action 会强制统一格式：")
-    print("       action[:6] -> clip 到 [-1,1]")
-    print("       action[6]  -> -1 / 0 / +1 三值事件")
-    print("   - grasp_penalty 会按最终保存的 action[6] 重新计算，避免 hold 被错误处罚。")
-    print("   - demos 保存的图像不直接等于 ENV_IMAGE_KEYS，而是按 image_keys 裁剪。")
-    print()
-    print("===== 当前相机/观测保存配置 =====")
-    print(f"env_config.ENV_IMAGE_KEYS      = {getattr(env_config, 'ENV_IMAGE_KEYS', None)}")
-    print(f"env_config.image_keys          = {getattr(env_config, 'image_keys', None)}")
-    print(f"env_config.classifier_keys     = {getattr(env_config, 'classifier_keys', None)}")
-    print(f"demo_image_keys                = {demo_image_keys if demo_image_keys is not None else 'all'}")
-    print(f"demo_extra_obs_keys            = {demo_extra_obs_keys}")
-    print(f"demo_strict_obs_keys           = {FLAGS.demo_strict_obs_keys}")
-    print(f"grasp_penalty_value            = {FLAGS.grasp_penalty_value}")
-    print("================================\n")
-
-    env = env_config.get_environment(
-        fake_env=False,
-        save_video=FLAGS.save_video,
-        classifier=FLAGS.classifier,
-    )
+    env = env_config.get_environment(fake_env=False, save_video=FLAGS.save_video, classifier=FLAGS.classifier)
 
     obs, info = env.reset()
-    safe_idle_action = build_safe_idle_action(env.action_space.shape)
+    print_green("✅ 环境 reset 完成。")
+    wait_for_vr_takeover_no_env_step(env, ros_sub, reason="initial_reset")
 
-    print("✅ 环境重置完成，请戴上 VR 头显准备接管！")
-    print("⏳ 当前不会记录 reset 后等待帧；检测到第一次 VR 接管后才开始记录本条 demo。")
-
-    transitions = []
-    success_count = 0
-    success_needed = FLAGS.successes_needed
-    max_episode_steps = FLAGS.max_episode_steps
-
-    pbar = tqdm(total=success_needed, desc="成功收集的 Demo 数量")
-
-    trajectory = []
+    raw_episodes = []
+    current_episode = []
     returns = 0.0
     episode_step = 0
+    success_count = 0
 
-    stable_gripper_state = None
-    recording_started = False
+    pbar = tqdm(total=int(FLAGS.successes_needed), desc="成功收集的 Raw Demo 数量")
 
-    while success_count < success_needed:
-        base_env = env.unwrapped
-
-        # 非 reset 阶段，如果还在 Mode 2，就什么都不发，只等待切回 Mode 0
-        if getattr(base_env, "script_control_enabled", False):
-            time.sleep(0.05)
-            continue
-
-        exec_action = safe_idle_action.copy()
-
-        # 这里 env.step 内部仍然能看到完整 obs。
-        # 所以 classifier_keys=["left_wrist_rgb"] 的 reward 判断不受 demos 裁剪影响。
-        next_obs, rew, done, truncated, info = env.step(exec_action)
-
-        had_intervention = "intervene_action" in info
-        raw_episode_end = bool(done or truncated)
-
-        # ------------------------------------------------------
-        # reset 后录制门控：
-        # 没有第一次 VR 接管之前，不记录 transition，不计 step，不累计 return。
-        # ------------------------------------------------------
-        if not recording_started:
-            if not had_intervention:
-                if raw_episode_end:
-                    print(
-                        "\n⚠️ 未开始记录时环境已经结束。"
-                        f" reward={rew}, done={done}, truncated={truncated}。"
-                        " 这通常是 reset/等待画面触发了 classifier 或环境终止，当前片段不会保存，重新 reset。"
-                    )
-                    obs, info = env.reset()
-                    safe_idle_action = build_safe_idle_action(env.action_space.shape)
-                    trajectory = []
-                    returns = 0.0
-                    episode_step = 0
-                    stable_gripper_state = None
-                    recording_started = False
-                    print("✅ 重新 reset 完成，继续等待第一次 VR 接管。")
-                    continue
-
-                obs = next_obs
-                time.sleep(0.01)
-                continue
-
-            recording_started = True
-            print("🎬 检测到第一次 VR 接管，开始记录本条 demo。")
-
-        # 只有开始记录后，才累计 return / step
-        returns += float(rew)
-        episode_step += 1
-
-        # ------------------------------------------------------
-        # 记录逻辑：
-        # - 有 VR 接管：记录 intervene_action
-        # - 已经开始记录后，如果某些帧没有 VR 接管：记录零动作/空闲帧
-        # ------------------------------------------------------
-        if had_intervention:
-            raw_actions = np.asarray(info["intervene_action"], dtype=np.float32)
-            raw_source = "info.intervene_action"
-        else:
+    try:
+        while success_count < int(FLAGS.successes_needed):
             raw_actions = np.zeros(env.action_space.shape, dtype=np.float32)
-            raw_source = "zero_after_recording_started"
 
-        raw_actions = sanitize_single_arm_action_for_storage(
-            raw_actions,
-            quantize_gripper=False,
-            source=raw_source,
-        )
+            before_pose_snapshot = ros_sub.snapshot()
+            step_t0 = time.time()
+            next_obs, rew, done, truncated, info = env.step(raw_actions)
+            wall_dt = time.time() - step_t0
+            after_pose_snapshot = ros_sub.snapshot()
 
-        # 夹爪三值重写必须使用完整 obs / next_obs，因为 state 在完整 obs 中。
-        actions, stable_gripper_state = rewrite_gripper_action_to_official_style(
-            raw_actions,
-            obs,
-            next_obs,
-            stable_gripper_state,
-        )
+            if "intervene_action" in info:
+                raw_actions = np.asarray(info["intervene_action"], dtype=np.float32)
 
-        actions = sanitize_single_arm_action_for_storage(
-            actions,
-            quantize_gripper=True,
-            source="after_gripper_rewrite",
-        )
+            returns += float(rew)
+            episode_step += 1
 
-        forced_timeout = False
-        if episode_step >= max_episode_steps and not raw_episode_end:
-            forced_timeout = True
-            truncated = True
-            print(f"\n⏰ 达到最大录制时长：{max_episode_steps} 步，强制截断当前回合。")
+            forced_timeout = False
+            if episode_step >= int(FLAGS.max_episode_steps) and not (done or truncated):
+                forced_timeout = True
+                truncated = True
+                print_yellow(f"\n⏰ 达到最大录制时长：{FLAGS.max_episode_steps} 步，强制截断当前回合。")
 
-        episode_end = bool(done or truncated)
-
-        # 这里是关键：
-        # 保存 transition 时裁剪 obs/next_obs，只保留 demo_image_keys + state。
-        transition = copy.deepcopy(
-            dict(
-                observations=prune_obs_for_demo_storage(
-                    obs,
-                    image_keys=demo_image_keys,
-                    extra_obs_keys=demo_extra_obs_keys,
-                    strict=FLAGS.demo_strict_obs_keys,
-                ),
-                actions=actions,
-                next_observations=prune_obs_for_demo_storage(
-                    next_obs,
-                    image_keys=demo_image_keys,
-                    extra_obs_keys=demo_extra_obs_keys,
-                    strict=FLAGS.demo_strict_obs_keys,
-                ),
-                rewards=float(rew),
-                masks=1.0 - float(episode_end),
-                dones=episode_end,
-                infos=copy.deepcopy(info),
+            episode_end = bool(done or truncated)
+            raw_step = make_raw_step(
+                obs=obs,
+                next_obs=next_obs,
+                reward=rew,
+                done=done,
+                truncated=truncated,
+                info=info,
+                raw_actions=raw_actions,
+                before_pose_snapshot=before_pose_snapshot,
+                after_pose_snapshot=after_pose_snapshot,
+                episode_step=episode_step,
+                wall_dt=wall_dt,
             )
-        )
+            raw_step["forced_timeout"] = bool(forced_timeout)
 
-        transition = finalize_transition_for_demo_storage(
-            transition,
-            demo_image_keys=demo_image_keys,
-            demo_extra_obs_keys=demo_extra_obs_keys,
-        )
+            if should_keep_raw_step_like_old_demo(raw_step, raw_actions, episode_end):
+                current_episode.append(raw_step)
 
-        trajectory.append(transition)
+            pbar.set_description(
+                f"Raw Demo {success_count}/{FLAGS.successes_needed} | "
+                f"Return {returns:.2f} | kept {len(current_episode)} | step {episode_step}/{FLAGS.max_episode_steps}"
+            )
 
-        pbar.set_description(
-            f"成功 Demo 数: {success_count}/{success_needed} | "
-            f"Return: {returns:.2f} | "
-            f"Recorded Step: {episode_step}/{max_episode_steps}"
-        )
+            obs = next_obs
 
-        # 注意：obs 要保留完整 next_obs，不能用裁剪后的 obs。
-        # 因为下一步 reward/gripper rewrite 还需要完整观测。
-        obs = next_obs
+            if episode_end:
+                print("\n🔄 回合结束。")
+                print(f"   reward={rew}, done={done}, truncated={truncated}, forced_timeout={forced_timeout}")
+                print(f"   info.succeed={info.get('succeed', None)}")
+                print(f"   kept raw steps={len(current_episode)}, env episode_step={episode_step}")
 
-        if episode_end:
-            print("\n🔄 回合结束。")
-            print(f"   reward={rew}, done={done}, truncated={truncated}, forced_timeout={forced_timeout}")
-            print(f"   info.succeed={info.get('succeed', None)}")
-            print(f"   recording_started={recording_started}, recorded_steps={episode_step}")
-
-            if FLAGS.classifier:
-                succeed = bool(
-                    info.get(
-                        "success",
-                        info.get(
-                            "is_success",
-                            info.get("succeed", False),
-                        ),
-                    )
-                )
-
-                if succeed and FLAGS.manual_confirm_on_success:
-                    print("📝 classifier 判定成功，请人工确认本回合是否真的成功。")
+                if FLAGS.classifier:
+                    succeed = bool(info.get("succeed", False))
+                    if succeed and FLAGS.manual_confirm_on_success:
+                        print("📝 classifier 判定成功，请人工确认本回合是否真的成功。")
+                        succeed = ask_success_from_terminal()
+                else:
+                    print("📝 当前 classifier=False，使用人工判定 success / fail。")
                     succeed = ask_success_from_terminal()
 
-                if len(trajectory) > 0:
-                    trajectory[-1]["infos"] = copy.deepcopy(info)
-                    trajectory[-1]["infos"]["succeed"] = succeed
-                    trajectory[-1]["infos"]["success"] = succeed
-                    trajectory[-1]["infos"]["is_success"] = succeed
-                    trajectory[-1]["dones"] = True
-                    trajectory[-1]["masks"] = 0.0
-                    trajectory[-1]["rewards"] = float(succeed)
+                if len(current_episode) > 0:
+                    current_episode[-1]["infos"] = copy.deepcopy(info)
+                    current_episode[-1]["infos"]["succeed"] = bool(succeed)
 
-                    # 重新 finalize 一次，防止上面 copy.deepcopy(info) 把旧 grasp_penalty 覆盖回来。
-                    trajectory[-1] = finalize_transition_for_demo_storage(
-                        trajectory[-1],
-                        demo_image_keys=demo_image_keys,
-                        demo_extra_obs_keys=demo_extra_obs_keys,
-                    )
+                if succeed and len(current_episode) > 0:
+                    # 确保最终导出的 demo reward/done/mask 结构和之前一致。
+                    current_episode[-1]["reward"] = 1.0
+                    current_episode[-1]["done"] = True
+                    current_episode[-1]["episode_end"] = True
+                    current_episode[-1]["mask"] = 0.0
 
-            else:
-                print("📝 当前 classifier=False，使用人工判定 success / fail。")
-                succeed = ask_success_from_terminal()
+                    raw_episodes.append(copy.deepcopy(current_episode))
+                    success_count += 1
+                    pbar.update(1)
+                    print_green(f"🎉 成功录制 1 条 Raw Demo！累计={success_count}, 长度={len(current_episode)}")
+                else:
+                    print_yellow("❌ 当前回合失败，或没有有效操作帧，已丢弃该 raw 轨迹。")
 
-                if len(trajectory) > 0:
-                    trajectory[-1]["infos"] = copy.deepcopy(info)
-                    trajectory[-1]["infos"]["succeed"] = succeed
-                    trajectory[-1]["infos"]["success"] = succeed
-                    trajectory[-1]["infos"]["is_success"] = succeed
-                    trajectory[-1]["rewards"] = float(succeed)
-                    trajectory[-1]["dones"] = True
-                    trajectory[-1]["masks"] = 0.0
+                current_episode = []
+                returns = 0.0
+                episode_step = 0
 
-                    # 重新 finalize 一次，防止上面 copy.deepcopy(info) 把旧 grasp_penalty 覆盖回来。
-                    trajectory[-1] = finalize_transition_for_demo_storage(
-                        trajectory[-1],
-                        demo_image_keys=demo_image_keys,
-                        demo_extra_obs_keys=demo_extra_obs_keys,
-                    )
+                if success_count >= int(FLAGS.successes_needed):
+                    break
 
-            if succeed and len(trajectory) > 0:
-                clean_trajectory = []
-                for trans in trajectory:
-                    trans = finalize_transition_for_demo_storage(
-                        trans,
-                        demo_image_keys=demo_image_keys,
-                        demo_extra_obs_keys=demo_extra_obs_keys,
-                    )
-                    clean_trajectory.append(trans)
+                print("🔄 正在复位机器人...")
+                obs, info = env.reset()
+                print_green("✅ reset 完成。")
+                wait_for_vr_takeover_no_env_step(env, ros_sub, reason=f"after_episode_{success_count}")
+                print("-" * 60)
 
-                transitions.extend(copy.deepcopy(clean_trajectory))
-                success_count += 1
-                pbar.update(1)
-
-                print(f"🎉 成功录制 1 条 Demo！当前累计成功条数: {success_count}")
-                print_trajectory_action_stats(clean_trajectory)
-                print_obs_keys_summary(clean_trajectory, name="clean_trajectory")
-
-            else:
-                print("❌ 当前回合失败或未成功，已丢弃该轨迹。")
-
-            trajectory = []
-            returns = 0.0
-            episode_step = 0
-            stable_gripper_state = None
-            recording_started = False
-
-            if success_count >= success_needed:
-                break
-
-            print("🔄 正在复位机器人...")
-            obs, info = env.reset()
-            safe_idle_action = build_safe_idle_action(env.action_space.shape)
-            print("✅ 复位完成。等待第一次 VR 接管后才开始记录下一条 demo。\n" + "-" * 40)
-
-    # 保存前最终全局保险
-    transitions = [
-        finalize_transition_for_demo_storage(
-            t,
-            demo_image_keys=demo_image_keys,
-            demo_extra_obs_keys=demo_extra_obs_keys,
-        )
-        for t in transitions
-    ]
-
-    save_dir = os.path.join(os.path.dirname(__file__), "demo_data_single")
-    os.makedirs(save_dir, exist_ok=True)
+    finally:
+        pbar.close()
+        ros_sub.stop()
 
     uuid = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    file_name = os.path.join(
-        save_dir,
-        f"{FLAGS.exp_name}_{success_needed}_demos_official_style_clean_pruned_{uuid}.pkl",
-    )
+    raw_save_dir = FLAGS.raw_save_dir or os.path.join(EXAMPLES_DIR, "raw_abs_demo_data_single")
+    ensure_dir(raw_save_dir)
+    raw_file = os.path.join(raw_save_dir, f"{FLAGS.exp_name}_{len(raw_episodes)}_raw_abs_{uuid}.pkl")
 
-    with open(file_name, "wb") as f:
-        pkl.dump(transitions, f)
+    payload = {
+        "format_version": "raw_abs_pose_demo_v2_wait_vr_no_env_step",
+        "metadata": {
+            "exp_name": FLAGS.exp_name,
+            "successes_needed": int(FLAGS.successes_needed),
+            "created_time": uuid,
+            "feedback_pose_topic": FLAGS.feedback_pose_topic,
+            "target_pose_topic": FLAGS.target_pose_topic,
+            "control_mode_topic": FLAGS.control_mode_topic,
+            "vr_control_mode_value": int(FLAGS.vr_control_mode_value),
+            "classifier": bool(FLAGS.classifier),
+            "max_episode_steps": int(FLAGS.max_episode_steps),
+            "record_all_raw_steps": bool(FLAGS.record_all_raw_steps),
+            "keep_pose_motion_without_intervention": bool(FLAGS.keep_pose_motion_without_intervention),
+        },
+        "episodes": raw_episodes,
+    }
 
-    print(f"\n💾 恭喜！成功保存 {success_needed} 条 Demo 数据至 {file_name}")
-    print(f"📊 总 transition 数量: {len(transitions)}")
+    with open(raw_file, "wb") as f:
+        pkl.dump(payload, f)
 
-    print_obs_keys_summary(transitions, name="final_demos")
+    print_green(f"\n💾 Raw absolute demos saved: {raw_file}")
+    print_green(f"📊 Raw episode count: {len(raw_episodes)}")
+    print_green(f"📊 Raw transition count: {sum(len(ep) for ep in raw_episodes)}")
+    return raw_file, payload
 
-    if len(transitions) > 0:
-        all_actions = np.asarray([t["actions"] for t in transitions], dtype=np.float32)
-        print("\n===== 最终保存 action 检查 =====")
-        print(f"actions shape: {all_actions.shape}")
-        print(f"global min={float(np.min(all_actions)):.6f}")
-        print(f"global max={float(np.max(all_actions)):.6f}")
-        print(f"global absmax={float(np.max(np.abs(all_actions))):.6f}")
-        print(f"arm absmax={float(np.max(np.abs(all_actions[:, :6]))):.6f}")
+# =============================================================================
+# 10. conversion
+# =============================================================================
+def load_raw_payload(path):
+    with open(path, "rb") as f:
+        payload = pkl.load(f)
+    if isinstance(payload, dict) and "episodes" in payload:
+        return payload
+    if isinstance(payload, list):
+        return {"format_version": "raw_abs_pose_demo_unknown", "metadata": {"source_path": path}, "episodes": payload}
+    raise ValueError(f"无法识别 raw absolute demo 格式: {type(payload)}")
 
-        g = all_actions[:, 6]
-        print(
-            "gripper 分布:",
-            {
-                "close(-1)": int(np.sum(g < -0.5)),
-                "hold(0)": int(np.sum(np.abs(g) <= 0.5)),
-                "open(+1)": int(np.sum(g > 0.5)),
-            },
-        )
 
-        all_penalties = []
-        for t in transitions:
-            p = extract_saved_grasp_penalty(t)
-            if p is not None:
-                all_penalties.append(float(p))
+def raw_pose_for_source(raw_step, source, when):
+    return raw_step.get("poses", {}).get(source, {}).get(when, None)
 
-        if all_penalties:
-            all_penalties = np.asarray(all_penalties, dtype=np.float32)
-            vals, cnts = np.unique(np.round(all_penalties, 8), return_counts=True)
-            dist = {float(v): int(c) for v, c in zip(vals, cnts)}
-            print("\n===== 最终保存 grasp_penalty 检查 =====")
-            print(f"grasp_penalty shape: {all_penalties.shape}")
-            print(f"grasp_penalty 分布: {dist}")
-            print(f"grasp_penalty 非零数量: {int(np.sum(np.abs(all_penalties) > 1e-8))}")
-            print(f"grasp_penalty sum: {float(np.sum(all_penalties)):.6f}")
 
-            expected_nonzero = int(np.sum(np.abs(g) > 0.5))
-            actual_nonzero = int(np.sum(np.abs(all_penalties) > 1e-8))
-            print(f"按 gripper 事件预期非零 penalty 数量: {expected_nonzero}")
-            print(f"实际非零 penalty 数量: {actual_nonzero}")
+def is_converted_static(action, reward, done):
+    a = np.asarray(action, dtype=np.float32).reshape(-1)
+    if a.shape[0] != 7:
+        return False
+    if done or abs(float(reward)) > 1e-12:
+        return False
+    return bool(np.all(np.abs(a) <= float(FLAGS.static_action_eps)))
 
-            if expected_nonzero != actual_nonzero:
-                print("⚠️ grasp_penalty 非零数量和 gripper open/close 事件数量不一致，请检查。")
+
+def convert_raw_episodes_to_transitions(raw_episodes, source, pos_scale, rot_scale):
+    if source not in ("feedback", "target"):
+        raise ValueError(f"source must be feedback/target, got {source}")
+
+    transitions = []
+    stats = Counter()
+    action_list = []
+    episode_lengths = []
+
+    for ep_idx, episode in enumerate(raw_episodes):
+        prev_stable_state = None
+        ep_count = 0
+        for raw_idx, raw_step in enumerate(episode):
+            stats["raw_steps"] += 1
+
+            pose_before = raw_pose_for_source(raw_step, source, "before")
+            pose_after = raw_pose_for_source(raw_step, source, "after")
+            action6, extra = normalized_action6_from_pose_delta(pose_before, pose_after, pos_scale, rot_scale)
+            if action6 is None:
+                stats["skipped_missing_pose"] += 1
+                continue
+
+            prev_feedback = raw_step.get("gripper_feedback_before", extract_gripper_feedback(raw_step.get("observations", {})))
+            next_feedback = raw_step.get("gripper_feedback_after", extract_gripper_feedback(raw_step.get("next_observations", {})))
+            gripper_event, prev_stable_state, stable_before = gripper_event_from_feedback(
+                prev_feedback,
+                next_feedback,
+                prev_stable_state,
+            )
+
+            action = np.zeros(7, dtype=np.float32)
+            action[:6] = action6
+            action[6] = np.float32(gripper_event)
+
+            reward = float(raw_step.get("reward", 0.0))
+            done = bool(raw_step.get("episode_end", raw_step.get("done", False)))
+            mask = 1.0 - float(done)
+
+            if FLAGS.drop_static_converted and is_converted_static(action, reward, done):
+                stats["dropped_static"] += 1
+                continue
+
+            gp = recompute_grasp_penalty_from_action(action)
+            info = copy.deepcopy(raw_step.get("infos", {}))
+            if not isinstance(info, dict):
+                info = {"raw_info_repr": repr(info)}
+
+            info["abs_pose_conversion"] = {
+                "pose_source": source,
+                "episode_index": ep_idx,
+                "raw_step_index": raw_idx,
+                "pos_scale": float(pos_scale),
+                "rot_scale": float(rot_scale),
+                "delta_pos_m": np.asarray(extra["delta_pos_m"], dtype=np.float64),
+                "delta_rotvec_rad": np.asarray(extra["delta_rotvec_rad"], dtype=np.float64),
+                "raw_normalized_action6": np.asarray(extra["raw_normalized_action6"], dtype=np.float64),
+                "was_clipped": bool(extra["was_clipped"]),
+                "pose_before": copy.deepcopy(pose_before),
+                "pose_after": copy.deepcopy(pose_after),
+                "gripper_feedback_before": prev_feedback,
+                "gripper_feedback_after": next_feedback,
+                "stable_gripper_before": stable_before,
+                "stable_gripper_after": prev_stable_state,
+                "gripper_event": float(gripper_event),
+            }
+            info["grasp_penalty"] = float(gp)
+            info["grasp_penalty_source"] = f"abs_pose_conversion:{source}"
+
+            transition = dict(
+                # 按旧 demo 逻辑保存图像：只保存 env_config.image_keys + state。
+                # 不按 ENV_IMAGE_KEYS 保存，避免 left_wrist_rgb 混入 RLPD policy demo。
+                observations=prune_obs_for_converted_demo(raw_step["observations"]),
+                actions=action.astype(np.float32),
+                next_observations=prune_obs_for_converted_demo(raw_step["next_observations"]),
+                rewards=float(reward),
+                masks=float(mask),
+                dones=bool(done),
+                infos=info,
+                grasp_penalty=float(gp),
+            )
+            transitions.append(transition)
+            action_list.append(action.copy())
+            ep_count += 1
+
+            stats["converted_steps"] += 1
+            stats["clip_count"] += int(extra["was_clipped"])
+            stats["reward_pos"] += int(reward > 0)
+            stats["done"] += int(done)
+            stats["mask0"] += int(abs(mask) < 1e-12)
+            if abs(gripper_event) > 0.5:
+                stats["gripper_event"] += 1
+                if gripper_event < 0:
+                    stats["close"] += 1
+                else:
+                    stats["open"] += 1
             else:
-                print("✅ grasp_penalty 已与最终 gripper 三值事件对齐。")
+                stats["hold"] += 1
 
-        if float(np.max(np.abs(all_actions[:, :6]))) > 1.0001:
-            print("❌ 保存后的 action 仍然超界，请不要用于训练。")
-        else:
-            print("✅ 保存后的 action[:6] 全部在 [-1,1]，可用于 RLPD demos。")
+        if ep_count:
+            episode_lengths.append(ep_count)
+
+    arr = np.stack(action_list, axis=0) if action_list else np.zeros((0, 7), dtype=np.float32)
+    summary = {
+        "source": source,
+        "episodes": int(len(raw_episodes)),
+        "raw_steps": int(stats["raw_steps"]),
+        "converted_steps": int(stats["converted_steps"]),
+        "skipped_missing_pose": int(stats["skipped_missing_pose"]),
+        "dropped_static": int(stats["dropped_static"]),
+        "clip_count": int(stats["clip_count"]),
+        "reward_pos": int(stats["reward_pos"]),
+        "done": int(stats["done"]),
+        "mask0": int(stats["mask0"]),
+        "gripper_dist": {
+            "hold(0)": int(stats["hold"]),
+            "close(-1)": int(stats["close"]),
+            "open(+1)": int(stats["open"]),
+        },
+        "episode_lengths": episode_lengths,
+        "action_min": arr.min(axis=0) if arr.size else None,
+        "action_max": arr.max(axis=0) if arr.size else None,
+        "action_mean": arr.mean(axis=0) if arr.size else None,
+        "action_std": arr.std(axis=0) if arr.size else None,
+    }
+    return transitions, summary
+
+
+def stats_of_values(values):
+    arr = np.asarray([v for v in values if v is not None and np.isfinite(v)], dtype=np.float64)
+    if arr.size == 0:
+        return {"count": 0, "mean": None, "max": None, "p95": None, "min": None}
+    return {
+        "count": int(arr.size),
+        "mean": float(np.mean(arr)),
+        "max": float(np.max(arr)),
+        "p95": float(np.percentile(arr, 95)),
+        "min": float(np.min(arr)),
+    }
+
+
+def compute_feedback_target_delta_diagnostics(raw_episodes, pos_scale, rot_scale):
+    pos_err_norms = []
+    rot_err_norms = []
+    norm_action_err_norms = []
+    target_pos_norms = []
+    feedback_pos_norms = []
+    target_rot_norms = []
+    feedback_rot_norms = []
+    missing_count = 0
+    total = 0
+    examples = []
+
+    for ep_idx, episode in enumerate(raw_episodes):
+        for raw_idx, raw_step in enumerate(episode):
+            total += 1
+            fb_pos, fb_rot = pose_delta_to_components(
+                raw_pose_for_source(raw_step, "feedback", "before"),
+                raw_pose_for_source(raw_step, "feedback", "after"),
+            )
+            tg_pos, tg_rot = pose_delta_to_components(
+                raw_pose_for_source(raw_step, "target", "before"),
+                raw_pose_for_source(raw_step, "target", "after"),
+            )
+            if fb_pos is None or tg_pos is None:
+                missing_count += 1
+                continue
+            pos_err = tg_pos - fb_pos
+            rot_err = tg_rot - fb_rot
+            norm_action_err = np.concatenate([pos_err / float(pos_scale), rot_err / float(rot_scale)])
+
+            pos_err_norms.append(float(np.linalg.norm(pos_err)))
+            rot_err_norms.append(float(np.linalg.norm(rot_err)))
+            norm_action_err_norms.append(float(np.linalg.norm(norm_action_err)))
+            target_pos_norms.append(float(np.linalg.norm(tg_pos)))
+            feedback_pos_norms.append(float(np.linalg.norm(fb_pos)))
+            target_rot_norms.append(float(np.linalg.norm(tg_rot)))
+            feedback_rot_norms.append(float(np.linalg.norm(fb_rot)))
+
+            if len(examples) < 20:
+                examples.append({
+                    "episode": ep_idx,
+                    "raw_step": raw_idx,
+                    "target_delta_pos_m": tg_pos,
+                    "feedback_delta_pos_m": fb_pos,
+                    "pos_error_m": pos_err,
+                    "target_rotvec_rad": tg_rot,
+                    "feedback_rotvec_rad": fb_rot,
+                    "rot_error_rad": rot_err,
+                    "normalized_action_error": norm_action_err,
+                    "pos_error_norm_m": float(np.linalg.norm(pos_err)),
+                    "rot_error_norm_rad": float(np.linalg.norm(rot_err)),
+                })
+
+    return {
+        "total_raw_steps": int(total),
+        "missing_pose_pairs": int(missing_count),
+        "valid_pairs": int(total - missing_count),
+        "pos_error_norm_m": stats_of_values(pos_err_norms),
+        "rot_error_norm_rad": stats_of_values(rot_err_norms),
+        "normalized_action_error_norm": stats_of_values(norm_action_err_norms),
+        "target_delta_pos_norm_m": stats_of_values(target_pos_norms),
+        "feedback_delta_pos_norm_m": stats_of_values(feedback_pos_norms),
+        "target_delta_rot_norm_rad": stats_of_values(target_rot_norms),
+        "feedback_delta_rot_norm_rad": stats_of_values(feedback_rot_norms),
+        "examples": examples,
+    }
+
+
+def obs_equal(a, b):
+    if isinstance(a, dict) and isinstance(b, dict):
+        if set(a.keys()) != set(b.keys()):
+            return False
+        return all(obs_equal(a[k], b[k]) for k in a.keys())
+    try:
+        return bool(np.array_equal(np.asarray(a), np.asarray(b)))
+    except Exception:
+        return a == b
+
+
+def compare_converted_non_action(feedback_transitions, target_transitions):
+    n = min(len(feedback_transitions), len(target_transitions))
+    out = Counter()
+    out["feedback_count"] = len(feedback_transitions)
+    out["target_count"] = len(target_transitions)
+    out["min_count"] = n
+    for i in range(n):
+        f = feedback_transitions[i]
+        t = target_transitions[i]
+        out["obs_mismatch"] += int(not obs_equal(f.get("observations"), t.get("observations")))
+        out["next_obs_mismatch"] += int(not obs_equal(f.get("next_observations"), t.get("next_observations")))
+        out["reward_mismatch"] += int(abs(float(f.get("rewards", 0.0)) - float(t.get("rewards", 0.0))) > 1e-12)
+        out["done_mismatch"] += int(bool(f.get("dones", False)) != bool(t.get("dones", False)))
+        out["mask_mismatch"] += int(abs(float(f.get("masks", 1.0)) - float(t.get("masks", 1.0))) > 1e-12)
+        fa = np.asarray(f.get("actions", []), dtype=np.float32).reshape(-1)
+        ta = np.asarray(t.get("actions", []), dtype=np.float32).reshape(-1)
+        out["gripper_action_mismatch"] += int(fa.size != 7 or ta.size != 7 or abs(float(fa[6]) - float(ta[6])) > 1e-6)
+        out["grasp_penalty_mismatch"] += int(abs(float(f.get("grasp_penalty", 0.0)) - float(t.get("grasp_penalty", 0.0))) > 1e-12)
+    return dict(out)
+
+
+def print_conversion_summary(s):
+    print_blue(f"\n===== Converted stats: {s['source']} =====")
+    print(f"episodes              : {s['episodes']}")
+    print(f"raw_steps             : {s['raw_steps']}")
+    print(f"converted_steps       : {s['converted_steps']}")
+    print(f"skipped_missing_pose  : {s['skipped_missing_pose']}")
+    print(f"dropped_static        : {s['dropped_static']}")
+    print(f"clip_count            : {s['clip_count']}")
+    print(f"reward>0/done/mask0   : {s['reward_pos']} / {s['done']} / {s['mask0']}")
+    print(f"gripper_dist          : {s['gripper_dist']}")
+    if s["episode_lengths"]:
+        arr = np.asarray(s["episode_lengths"])
+        print(f"episode length        : min={arr.min()}, max={arr.max()}, mean={arr.mean():.2f}")
+    if s["action_min"] is not None:
+        print(f"action min            : {np.round(s['action_min'], 4).tolist()}")
+        print(f"action max            : {np.round(s['action_max'], 4).tolist()}")
+        print(f"action mean           : {np.round(s['action_mean'], 4).tolist()}")
+        print(f"action std            : {np.round(s['action_std'], 4).tolist()}")
+
+
+def resolve_sources_interactive():
+    value = str(FLAGS.convert_source).strip().lower()
+    aliases = {
+        "1": "feedback",
+        "feedback": "feedback",
+        "motion_control": "feedback",
+        "control": "feedback",
+        "ee": "feedback",
+        "2": "target",
+        "target": "target",
+        "motion_target": "target",
+        "cmd": "target",
+        "command": "target",
+        "3": "both",
+        "both": "both",
+        "all": "both",
+    }
+    if value == "prompt":
+        print("\n请选择用哪一种绝对位姿转换成训练 action：")
+        print("  1 = feedback 版本：/motion_control/pose_ee_arm_right，机器人实际末端反馈")
+        print("  2 = target   版本：/motion_target/target_pose_arm_right，控制目标/实际指令")
+        print("  3 = both     版本：两个都导出，并计算二者增量误差")
+        while True:
+            ans = input("请输入 1 / 2 / 3: ").strip()
+            if ans in aliases:
+                value = aliases[ans]
+                break
+            print("❌ 输入无效，请输入 1、2 或 3。")
+    else:
+        value = aliases.get(value, value)
+
+    if value == "feedback":
+        return ["feedback"]
+    if value == "target":
+        return ["target"]
+    if value == "both":
+        return ["feedback", "target"]
+    raise ValueError(f"Unknown convert_source={FLAGS.convert_source!r}; use prompt/feedback/target/both")
+
+
+def save_converted_outputs(raw_payload, sources):
+    pos_scale, rot_scale = resolve_scales()
+    print_green("\n✅ 开始归一化 / 离线转换")
+    print_green(f"   POS_SCALE = {pos_scale}")
+    print_green(f"   ROT_SCALE = {rot_scale}")
+    print_green(f"   convert sources = {sources}")
+
+    raw_episodes = raw_payload["episodes"]
+    converted_save_dir = FLAGS.converted_save_dir or os.path.join(EXAMPLES_DIR, "demo_data_single")
+    report_save_dir = FLAGS.report_save_dir or converted_save_dir
+    ensure_dir(converted_save_dir)
+    ensure_dir(report_save_dir)
+    uuid = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    converted_by_source = {}
+    stats_by_source = {}
+    output_files = {}
+
+    for source in sources:
+        transitions, stats = convert_raw_episodes_to_transitions(raw_episodes, source, pos_scale, rot_scale)
+        converted_by_source[source] = transitions
+        stats_by_source[source] = stats
+        print_conversion_summary(stats)
+        summarize_obs_keys_for_transitions(transitions, name=f"converted_{source}")
+
+        file_name = os.path.join(
+            converted_save_dir,
+            f"{FLAGS.exp_name}_{stats['episodes']}_demos_abs2rel_{source}_{uuid}.pkl",
+        )
+        with open(file_name, "wb") as f:
+            pkl.dump(transitions, f)
+        output_files[source] = file_name
+        print_green(f"💾 Converted {source} demo saved: {file_name}")
+
+    delta_diag = compute_feedback_target_delta_diagnostics(raw_episodes, pos_scale, rot_scale)
+    compare_diag = None
+    if "feedback" in converted_by_source and "target" in converted_by_source:
+        compare_diag = compare_converted_non_action(converted_by_source["feedback"], converted_by_source["target"])
+        print_blue("\n===== feedback vs target converted non-action compare =====")
+        print(json.dumps(json_safe(compare_diag), indent=2, ensure_ascii=False))
+
+    print_blue("\n===== feedback-target delta diagnostics =====")
+    short_diag = {
+        "total_raw_steps": delta_diag["total_raw_steps"],
+        "missing_pose_pairs": delta_diag["missing_pose_pairs"],
+        "valid_pairs": delta_diag["valid_pairs"],
+        "pos_error_norm_m": delta_diag["pos_error_norm_m"],
+        "rot_error_norm_rad": delta_diag["rot_error_norm_rad"],
+        "normalized_action_error_norm": delta_diag["normalized_action_error_norm"],
+        "target_delta_pos_norm_m": delta_diag["target_delta_pos_norm_m"],
+        "feedback_delta_pos_norm_m": delta_diag["feedback_delta_pos_norm_m"],
+        "target_delta_rot_norm_rad": delta_diag["target_delta_rot_norm_rad"],
+        "feedback_delta_rot_norm_rad": delta_diag["feedback_delta_rot_norm_rad"],
+    }
+    print(json.dumps(json_safe(short_diag), indent=2, ensure_ascii=False))
+
+    report = {
+        "format_version": "abs_pose_conversion_report_v2_wait_vr_no_env_step",
+        "pos_scale": float(pos_scale),
+        "rot_scale": float(rot_scale),
+        "sources": list(sources),
+        "converted_files": output_files,
+        "stats_by_source": stats_by_source,
+        "feedback_target_delta_diagnostics": delta_diag,
+        "converted_non_action_compare": compare_diag,
+        "converted_demo_image_keys": get_policy_image_keys_for_demo(),
+        "converted_demo_extra_obs_keys": get_extra_obs_keys_for_demo(),
+        "raw_metadata": raw_payload.get("metadata", {}),
+    }
+    report_json = os.path.join(report_save_dir, f"{FLAGS.exp_name}_abs2rel_report_{uuid}.json")
+    with open(report_json, "w", encoding="utf-8") as f:
+        json.dump(json_safe(report), f, indent=2, ensure_ascii=False)
+    print_green(f"📊 Conversion report saved: {report_json}")
+
+    return output_files, report_json
+
+# =============================================================================
+# 11. main
+# =============================================================================
+def main(_):
+    print_blue("=" * 100)
+    print_blue("Absolute Pose Demo Recorder + Offline Relative Action Converter")
+    print_blue("=" * 100)
+
+    sources = resolve_sources_interactive()
+
+    if FLAGS.raw_input_path:
+        raw_file = FLAGS.raw_input_path
+        print_green(f"📂 使用已有 raw absolute demo: {raw_file}")
+        raw_payload = load_raw_payload(raw_file)
+    else:
+        raw_file, raw_payload = record_raw_absolute_demos()
+
+    output_files, report_json = save_converted_outputs(raw_payload, sources)
+
+    print_green("\n✅ 全部完成")
+    print_green(f"Raw file     : {raw_file}")
+    for source, path in output_files.items():
+        print_green(f"Demo {source:8s}: {path}")
+    print_green(f"Report       : {report_json}")
+
+    print("\n下一步建议：")
+    print("1. 用 inspect_demo_pkl_all.py 检查导出的 demo pkl：")
+    print("   python inspect/inspect_demo_pkl_all.py --path <Demo pkl> --image_keys head_rgb right_wrist_rgb")
+    print("2. 如果 feedback 和 target 的 delta 误差较大，优先用 target 版本训练；")
+    print("   feedback 版本更适合诊断机器人实际执行是否跟上。")
+    print("3. 后续改 POS_SCALE / ROT_SCALE 时，不用重新录 raw，只需要：")
+    print("   python record_abs_pose_demos_and_convert_wait_vr.py --raw_input_path <raw pkl> --convert_source target")
 
 
 if __name__ == "__main__":
     app.run(main)
-
-
-

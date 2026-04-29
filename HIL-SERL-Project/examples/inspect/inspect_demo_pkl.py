@@ -1,22 +1,4 @@
-# 运行方式：
 
-#看目录下多组demos的总结
-# python inspect_demo_pkl_all.py \
-#   --dir /home/eren/HIL-SERL/HIL-SERL-Project/examples/demo_data_single \
-#   --all \
-#   --image_keys head_rgb right_wrist_rgb
-
-#详细分析单组demos的数据：
-# python inspect_demo_pkl_all.py \
-#   --path /home/eren/HIL-SERL/HIL-SERL-Project/examples/demo_data_single/galaxea_usb_insertion_single_20_demos_official_style_clean_pruned_2026-04-28_17-12-59.pkl \
-#   --image_keys head_rgb right_wrist_rgb
-
-# 导出 CSV：
-# python inspect_demo_pkl_all.py \
-#   --dir /home/eren/HIL-SERL/HIL-SERL-Project/examples/demo_data_single \
-#   --all \
-#   --image_keys head_rgb right_wrist_rgb \
-#   --summary_csv /home/eren/HIL-SERL/HIL-SERL-Project/examples/demo_data_single/demo_summary.csv
 
 
 """
@@ -40,23 +22,23 @@ inspect_demo_pkl_all.py
 典型用法：
 
 # 检查目录下所有 pkl，并输出每个文件 + 总计
-python inspect_demo_pkl_all.py \
+python inspect_demo_pkl.py \
   --dir /home/eren/HIL-SERL/HIL-SERL-Project/examples/demo_data_single \
   --all \
   --image_keys head_rgb right_wrist_rgb
 
 # 只检查最新 pkl，输出详细信息
-python inspect_demo_pkl_all.py \
+python inspect_demo_pkl.py \
   --dir /home/eren/HIL-SERL/HIL-SERL-Project/examples/demo_data_single \
   --image_keys head_rgb right_wrist_rgb
 
 # 指定某个 pkl
-python inspect_demo_pkl_all.py \
+python inspect_demo_pkl.py \
   --path /path/to/demo.pkl \
   --image_keys head_rgb right_wrist_rgb
 
 # 保存预览图
-python inspect_demo_pkl_all.py \
+python inspect_demo_pkl.py \
   --dir /path/to/demo_data_single \
   --all \
   --save_preview \

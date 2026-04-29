@@ -31,35 +31,49 @@
 
 
 
+# 回到 examples 目录运行
 
+# 推荐这样：
+
+# cd /home/eren/HIL-SERL/HIL-SERL-Project/examples
+
+# python demo_data_single/replay_demo_actions.py
 
 
 """
-replay_demo_full_motion_diagnostics_env_timing.py
+replay_demos_episode_by_episode_reset.py
 
-用途：
-  在播放 demo action 的同时，完整诊断手臂动作缩放、真实执行误差和夹爪链路。
+功能：
+1. 自动识别 demo pkl 中一共有多少条 demos / episodes。
+   - 支持 DEMO_PATH 是目录、单个 pkl、glob。
+   - 支持 list[transition]、dict{"transitions": ...}、dict{"episodes": ...}。
+   - 默认用 done=True / mask=0 / reward>0 作为 episode 结束边界。
 
-它会记录：
-  1. demo 里的 action[:6]：归一化末端增量动作
-  2. action[:6] 根据当前 POS_SCALE / ROT_SCALE 对应的理论真实位移/旋转
-  3. env.step(action) 前后的真实 EE pose
-  4. live obs delta 反推得到的真实执行 normalized action
-  5. live_delta_action - action 的 normalized error / 物理量 error
-  6. demo 里的 action[6]：close(-1) / hold(0) / open(+1)
-  7. env.step(action) 前后的真实 gripper feedback
-  8. env.unwrapped._last_hw_gripper_cmd 的 right/left 记忆值
-  9. reward / done / truncated
-  10. refresh_obs_after_sleep 是否成功
+2. 每次只播放一条 demo。
+   - 播放 demo_i 前 env.reset()
+   - reset 完成后进入脚本/IK模式
+   - 等待人工确认
+   - 播放 demo_i
+   - demo_i 播放结束后再次 reset，再播放 demo_i+1
 
-适用场景：
-  - 你确认独立 gripper 测试正常，但播放 demo 时夹爪仍然“要闭合又张开”
-  - 需要判断是动作缩放不合适、真实执行没跟上、VR/外部控制覆盖、夹爪 hold memory 异常，还是成功后脚本继续播放造成移动
+3. 保留原 replay 诊断逻辑：
+   - action[:6] 理论物理位移/旋转
+   - live obs 中 EE pose 前后差分
+   - live_delta_action - demo_action 误差
+   - gripper feedback 前后变化
+   - env._last_hw_gripper_cmd 记忆值
+   - reward / done / truncated
+   - CSV 保存
 
-注意：
-  - demo 里的 action[:6] 是归一化动作，不要在脚本外部乘 POS_SCALE / ROT_SCALE。
-  - 本脚本不会修改 demo、env、train_rlpd。
-  - 第一次可设 DRY_RUN=True；真机诊断设 DRY_RUN=False。
+使用：
+  python replay_demos_episode_by_episode_reset.py
+
+常用配置在文件顶部修改：
+  DEMO_PATH
+  FILE_INDEX
+  DEMO_INDEX_START / DEMO_INDEX_END
+  WAIT_ENTER_BEFORE_EACH_DEMO
+  STOP_ON_LIVE_REWARD / STOP_ON_LIVE_DONE
 """
 
 import os
@@ -89,39 +103,54 @@ from examples.galaxea_task.usb_pick_insertion_single.config import env_config
 
 # demo 路径：目录、单个 pkl、或 glob 都可以。
 DEMO_PATH = "./demo_data_single"
-DEMO_FILE_INDEX = 0
 
-START_TRANSITION = 0
-MAX_STEPS = None  # 建议第一次真机诊断先设 130，只覆盖 close 附近；确认后再 None。
+# None 表示读取 DEMO_PATH 匹配到的全部 pkl。
+# 0/1/2 表示只读取第几个 pkl。
+FILE_INDEX = None
+
+# 播放哪几条 demo。
+# DEMO_INDEX_START 从 0 开始。
+# DEMO_INDEX_END = None 表示播到最后；否则不包含 END。
+DEMO_INDEX_START = 0
+DEMO_INDEX_END = None
+
+# 每条 demo 内最多播放多少步。
+# None 表示播放该 demo 的全部 transition。
+MAX_STEPS_PER_DEMO = None
 
 DRY_RUN = False
 
 # 统一使用 env.step() 内部等待/刷新逻辑。
-# 重要：
-# - 如果 GalaxeaArmEnv.step() 里已经加入 ACTION_SETTLE_SEC，
-#   replay 脚本外层就不要再额外 sleep / _get_sync_obs。
-# - 这样 demo replay 和 actor 训练/执行走完全一样的 env 时序。
+# 如果 GalaxeaArmEnv.step() 里已经加入 ACTION_SETTLE_SEC，
+# replay 脚本外层就不要再额外 sleep / _get_sync_obs。
 STEP_SLEEP_SEC = 0.0
 REFRESH_OBS_AFTER_SLEEP = False
 
-WAIT_ENTER_BEFORE_REPLAY = True
+# 每条 demo 播放前是否等待按 Enter。
+WAIT_ENTER_BEFORE_EACH_DEMO = True
+
+# 每条 demo 播放结束 reset 前是否等待按 Enter。
+WAIT_ENTER_BEFORE_RESET_AFTER_DEMO = False
+
 FORCE_SCRIPT_MODE = True
 USE_CLASSIFIER = False
 
 CLIP_ACTION_FOR_SAFETY = True
 QUANTIZE_GRIPPER_FOR_SAFETY = True
 
-# 成功 / 终止后是否停止继续播放。
-# replay 诊断时建议打开，避免 reward=1 / done=True 后仍然继续移动。
-STOP_ON_REWARD = True
-STOP_ON_DONE = True
-STOP_ON_TRUNCATED = True
+# live reward/done/truncated 提前触发时是否停止当前 demo。
+# 建议 True，避免真实成功后继续播放剩余动作。
+STOP_ON_LIVE_REWARD = True
+STOP_ON_LIVE_DONE = True
+STOP_ON_LIVE_TRUNCATED = True
 
-# 如果你只是想看完整 demo 后续动作，可临时设 False。
+# demo pkl 自己的 terminal 帧一定会结束当前 demo。
+STOP_ON_DEMO_TERMINAL = True
+
 PRINT_EVERY = 1
 
 SAVE_CSV = True
-CSV_PATH = "./demo_replay_full_motion_diagnostics_env_timing.csv"
+CSV_PATH = "./demo_replay_episode_by_episode_reset_diagnostics.csv"
 
 # 夹爪 feedback 判定阈值，和 env/config 保持一致。
 HW_CLOSE_MAX = 30.0
@@ -130,23 +159,21 @@ HW_OPEN_MIN = 70.0
 # legacy demo 没有 metadata 时，用手动 scale 做离线提示。
 # 本脚本不做动作转换，只打印检查。
 MANUAL_DEMO_POS_SCALE = 0.02
-MANUAL_DEMO_ROT_SCALE = 0.04
+MANUAL_DEMO_ROT_SCALE = 0.03
 MANUAL_DEMO_HZ = 10
 
 STRICT_SCALE_FOR_LIVE_REPLAY = True
 
 # 手臂动作误差告警阈值。
-# 这些只用于打印/summary，不会改变动作。
 LIVE_WARN_POS_ERR_M = 0.005       # 5 mm
 LIVE_WARN_ROT_ERR_RAD = 0.05      # about 2.86 deg
 LIVE_WARN_ACTION_ERR_NORM = 0.5   # normalized action error
 
-# action 饱和统计阈值。
 SATURATION_THRESHOLD = 0.98
 
 
 # =============================================================================
-# 1. demo / metadata
+# 1. demo / metadata / episode grouping
 # =============================================================================
 
 def sorted_pkl_files(path: str) -> List[str]:
@@ -160,30 +187,221 @@ def sorted_pkl_files(path: str) -> List[str]:
     return files
 
 
-def load_demo_payload(path: str, file_index: int) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any], str]:
-    files = sorted_pkl_files(path)
-    if file_index < 0 or file_index >= len(files):
-        raise IndexError(f"DEMO_FILE_INDEX={file_index} 越界，共找到 {len(files)} 个 pkl 文件。")
-
-    file_path = files[file_index]
+def load_one_pkl(file_path: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str]:
     with open(file_path, "rb") as f:
         data = pkl.load(f)
+
+    metadata = {}
+
+    if isinstance(data, dict) and "episodes" in data:
+        # 支持 raw/episode 格式，但如果 episode 里面已经是 standard transition，也可以直接 flatten。
+        episodes_obj = data["episodes"]
+        metadata = data.get("metadata", {}) or {}
+        flat = []
+        for ep in episodes_obj:
+            if isinstance(ep, list):
+                flat.extend(ep)
+            else:
+                raise ValueError(f"episodes 里不是 list: {type(ep)}")
+        return flat, metadata, "dict_episodes_flattened"
 
     if isinstance(data, dict) and "transitions" in data:
         transitions = data["transitions"]
         metadata = data.get("metadata", {}) or {}
-        fmt = "dict_with_metadata" if metadata else "dict_without_metadata"
-    elif isinstance(data, list):
-        transitions = data
-        metadata = {}
-        fmt = "legacy_list"
-    else:
-        raise ValueError(f"无法识别 pkl 格式: type={type(data)}")
+        return transitions, metadata, "dict_with_transitions"
 
-    if len(transitions) == 0:
-        raise ValueError(f"pkl 为空: {file_path}")
+    if isinstance(data, list):
+        return data, {}, "legacy_list"
 
-    return file_path, transitions, metadata, fmt
+    raise ValueError(f"无法识别 pkl 格式: {file_path}, type={type(data)}")
+
+
+def transition_reward(trans: Dict[str, Any]) -> float:
+    for k in ("rewards", "reward"):
+        if k in trans:
+            try:
+                return float(np.asarray(trans[k]).reshape(-1)[0])
+            except Exception:
+                return float(trans[k])
+    return 0.0
+
+
+def transition_done(trans: Dict[str, Any]) -> bool:
+    for k in ("dones", "done"):
+        if k in trans:
+            try:
+                return bool(np.asarray(trans[k]).reshape(-1)[0])
+            except Exception:
+                return bool(trans[k])
+    return False
+
+
+def transition_mask(trans: Dict[str, Any]) -> Optional[float]:
+    for k in ("masks", "mask"):
+        if k in trans:
+            try:
+                return float(np.asarray(trans[k]).reshape(-1)[0])
+            except Exception:
+                return float(trans[k])
+    return None
+
+
+def is_episode_terminal(trans: Dict[str, Any]) -> bool:
+    """
+    标准成功 demo 通常满足：
+      reward=1, done=True, mask=0
+    这里放宽：done=True 或 mask=0 或 reward>0 都认为是一条 demo 的边界。
+    """
+    if transition_done(trans):
+        return True
+    mask = transition_mask(trans)
+    if mask is not None and abs(mask) < 1e-8:
+        return True
+    if transition_reward(trans) > 0:
+        return True
+    return False
+
+
+def split_transitions_into_episodes(
+    transitions: List[Dict[str, Any]],
+    source_file: str,
+    pkl_format: str,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    返回：
+      episodes: list of {
+        file_path, pkl_format, local_episode_index,
+        start_index, end_index_exclusive, transitions, complete
+      }
+      tails: 未以 terminal 结束的残留片段
+    """
+    episodes = []
+    tails = []
+
+    current = []
+    start_idx = 0
+    local_ep_idx = 0
+
+    for i, trans in enumerate(transitions):
+        if len(current) == 0:
+            start_idx = i
+        current.append(trans)
+
+        if is_episode_terminal(trans):
+            episodes.append({
+                "file_path": source_file,
+                "pkl_format": pkl_format,
+                "local_episode_index": local_ep_idx,
+                "start_index": start_idx,
+                "end_index_exclusive": i + 1,
+                "transitions": current,
+                "complete": True,
+            })
+            local_ep_idx += 1
+            current = []
+
+    if current:
+        tails.append({
+            "file_path": source_file,
+            "pkl_format": pkl_format,
+            "local_episode_index": local_ep_idx,
+            "start_index": start_idx,
+            "end_index_exclusive": len(transitions),
+            "transitions": current,
+            "complete": False,
+        })
+
+    return episodes, tails
+
+
+def load_all_demo_episodes(path: str, file_index: Optional[int]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    files = sorted_pkl_files(path)
+
+    if file_index is not None:
+        if file_index < 0 or file_index >= len(files):
+            raise IndexError(f"FILE_INDEX={file_index} 越界，共找到 {len(files)} 个 pkl 文件")
+        files = [files[file_index]]
+
+    all_episodes = []
+    all_tails = []
+    per_file = []
+
+    for file_i, fp in enumerate(files):
+        transitions, metadata, fmt = load_one_pkl(fp)
+        episodes, tails = split_transitions_into_episodes(transitions, fp, fmt)
+
+        for ep in episodes:
+            ep["file_global_index"] = file_i
+            ep["metadata"] = metadata
+
+        all_episodes.extend(episodes)
+        all_tails.extend(tails)
+
+        lengths = [len(e["transitions"]) for e in episodes]
+        per_file.append({
+            "file_path": fp,
+            "format": fmt,
+            "transition_count": len(transitions),
+            "episode_count": len(episodes),
+            "tail_count": len(tails),
+            "lengths": lengths,
+            "metadata": metadata,
+        })
+
+    summary = {
+        "files": files,
+        "per_file": per_file,
+        "total_episodes": len(all_episodes),
+        "total_tails": len(all_tails),
+    }
+    return all_episodes, all_tails, summary
+
+
+def print_episode_inventory(episodes: List[Dict[str, Any]], tails: List[Dict[str, Any]], summary: Dict[str, Any]) -> None:
+    print("=" * 100)
+    print("Demo inventory / episode 边界识别")
+    print("=" * 100)
+
+    print(f"pkl files loaded: {len(summary['files'])}")
+    for i, item in enumerate(summary["per_file"]):
+        lengths = item["lengths"]
+        if lengths:
+            length_desc = f"min={min(lengths)}, max={max(lengths)}, mean={np.mean(lengths):.2f}"
+        else:
+            length_desc = "N/A"
+        print("-" * 100)
+        print(f"[file {i}] {item['file_path']}")
+        print(f"  format           : {item['format']}")
+        print(f"  transitions      : {item['transition_count']}")
+        print(f"  completed demos  : {item['episode_count']}")
+        print(f"  incomplete tails : {item['tail_count']}")
+        print(f"  episode length   : {length_desc}")
+
+    print("=" * 100)
+    print(f"TOTAL completed demos : {len(episodes)}")
+    print(f"TOTAL incomplete tails: {len(tails)}")
+    if episodes:
+        lengths = [len(e["transitions"]) for e in episodes]
+        print(f"TOTAL length          : min={min(lengths)}, max={max(lengths)}, mean={np.mean(lengths):.2f}")
+
+    print("\n前 20 条 demo：")
+    for global_idx, ep in enumerate(episodes[:20]):
+        print(
+            f"  demo#{global_idx:03d} | file#{ep['file_global_index']} "
+            f"local#{ep['local_episode_index']} | "
+            f"range=[{ep['start_index']},{ep['end_index_exclusive']}) | "
+            f"len={len(ep['transitions'])} | "
+            f"{os.path.basename(ep['file_path'])}"
+        )
+
+    if tails:
+        print("\n⚠️ 发现未以 done/mask0/reward>0 结束的 tail，默认不播放：")
+        for t in tails[:10]:
+            print(
+                f"  tail file={os.path.basename(t['file_path'])}, "
+                f"range=[{t['start_index']},{t['end_index_exclusive']}), "
+                f"len={len(t['transitions'])}"
+            )
 
 
 def get_metadata_float(metadata: Dict[str, Any], *keys: str) -> Optional[float]:
@@ -207,8 +425,6 @@ def get_config_value(env, name: str, default: float) -> float:
     except Exception:
         pass
 
-    # env_config 是 TrainingConfig，实际 POS_SCALE 通常在硬件 env_cfg 里；
-    # 这里仅兜底。
     if hasattr(env_config, name):
         return float(getattr(env_config, name))
 
@@ -258,7 +474,7 @@ def check_scale_consistency(demo_pos, demo_rot, current_pos, current_rot, source
 
 
 # =============================================================================
-# 2. observation / gripper 工具
+# 2. observation / gripper / pose 工具
 # =============================================================================
 
 def to_1d_array(x) -> Optional[np.ndarray]:
@@ -272,13 +488,6 @@ def to_1d_array(x) -> Optional[np.ndarray]:
 
 
 def extract_pose_from_state_dict(state: Dict[str, Any], arm_side: str = "right") -> Optional[np.ndarray]:
-    """
-    从 obs["state"] 字典中提取 EE pose。
-    优先右臂 key；如果 key 名不同，会 fallback 搜索包含 pose/tcp/ee 的字段。
-    返回：
-      7 维: xyz + quat(x,y,z,w)
-      或 6 维: xyz + euler/rpy
-    """
     preferred_keys = []
 
     if arm_side == "right":
@@ -330,12 +539,6 @@ def extract_pose_from_state_dict(state: Dict[str, Any], arm_side: str = "right")
 
 
 def extract_ee_pose(obs: Dict[str, Any], arm_side: str = "right") -> Optional[np.ndarray]:
-    """
-    从 observation 中提取 EE pose。
-    兼容：
-      obs["state"] 是 dict
-      obs["state"] 是 array: [x,y,z,qx,qy,qz,qw,gripper...]
-    """
     if obs is None or not isinstance(obs, dict) or "state" not in obs:
         return None
 
@@ -357,11 +560,6 @@ def extract_ee_pose(obs: Dict[str, Any], arm_side: str = "right") -> Optional[np
 
 
 def pose_to_pos_quat(pose: Optional[np.ndarray]) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    """
-    支持：
-      7 维: xyz + quat(x,y,z,w)
-      6 维: xyz + euler/rpy(x,y,z)
-    """
     if pose is None:
         return None, None
 
@@ -391,12 +589,6 @@ def compute_delta_action_from_poses(
     rot_scale: float,
     clip: bool = False,
 ) -> Optional[np.ndarray]:
-    """
-    用真实 EE pose 差分反推 normalized action[:6]。
-    语义：
-      action[:3] = (next_pos - prev_pos) / POS_SCALE
-      action[3:6] = rotvec(next_rot * prev_rot.inv()) / ROT_SCALE
-    """
     if prev_pose is None or next_pose is None:
         return None
 
@@ -408,7 +600,6 @@ def compute_delta_action_from_poses(
 
     try:
         pos_delta = next_pos - prev_pos
-
         prev_rot = R.from_quat(prev_quat)
         next_rot = R.from_quat(next_quat)
         rot_delta = (next_rot * prev_rot.inv()).as_rotvec().astype(np.float32)
@@ -426,10 +617,6 @@ def compute_delta_action_from_poses(
 
 
 def compute_real_delta_from_action(action: np.ndarray, pos_scale: float, rot_scale: float) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    normalized action -> 理论真实位移 / 旋转增量。
-    注意：这里只用于检测和打印，不会把 scaled action 传给 env.step。
-    """
     a = np.asarray(action, dtype=np.float32).reshape(-1)
     pos_delta_m = a[:3] * float(pos_scale)
     rot_delta_rad = a[3:6] * float(rot_scale)
@@ -442,10 +629,6 @@ def compute_error_metrics(
     pos_scale: float,
     rot_scale: float,
 ) -> Optional[Dict[str, float]]:
-    """
-    observed_delta_action6 和 reference_action6 都是 normalized action 语义。
-    同时返回 normalized error 和物理量 error。
-    """
     if observed_delta_action6 is None or reference_action6 is None:
         return None
 
@@ -490,10 +673,6 @@ def error_is_large(metrics: Optional[Dict[str, float]]) -> bool:
 
 
 def get_transition_obs_pair(trans: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """
-    尽量从 pkl transition 里取 demo obs / next_obs。
-    不同脚本保存字段可能不同，所以做多 key 兼容。
-    """
     obs = None
     next_obs = None
 
@@ -508,19 +687,6 @@ def get_transition_obs_pair(trans: Dict[str, Any]) -> Tuple[Optional[Dict[str, A
             break
 
     return obs, next_obs
-
-
-def safe_float(value):
-    if value is None:
-        return ""
-    try:
-        v = float(value)
-        if not np.isfinite(v):
-            return ""
-        return v
-    except Exception:
-        return ""
-
 
 
 def extract_gripper_feedback(obs: Dict[str, Any], arm_side: str = "right") -> Optional[float]:
@@ -638,15 +804,8 @@ def print_state_keys(obs: Dict[str, Any]) -> None:
 
 def refresh_obs_after_sleep(env, fallback_obs, sleep_sec: float):
     """
-    统一使用 env.step() 的内部时序。
-
-    这个函数保留接口只是为了少改主循环：
-    - 不额外 sleep
-    - 不额外调用 env.unwrapped._get_sync_obs()
-    - 直接使用 env.step(action) 返回的 step_obs
-
-    如果需要防抖/等待/刷新，应该放到 GalaxeaArmEnv.step() 里，
-    由 config.ACTION_SETTLE_SEC 控制。
+    保留接口，但不额外 sleep、不额外 _get_sync_obs。
+    obs 直接使用 env.step(action) 返回值。
     """
     return fallback_obs, False, "env_step_obs_only"
 
@@ -655,7 +814,7 @@ def force_script_mode_if_possible(env) -> None:
     if not FORCE_SCRIPT_MODE or env is None:
         return
 
-    print("🤖 尝试强制进入脚本/AI动作测试模式，避免 VRInterventionWrapper 覆盖 action...")
+    print("🤖 尝试强制进入脚本/AI动作测试模式，避免 VRInterventionWrapper 覆盖 replay action...")
 
     current = env
     seen = set()
@@ -769,9 +928,9 @@ def save_csv(rows: List[Dict[str, Any]]) -> None:
     print(f"✅ CSV saved: {os.path.abspath(CSV_PATH)}")
 
 
-def summarize_rows(rows: List[Dict[str, Any]]) -> None:
+def summarize_rows(rows: List[Dict[str, Any]], title: str = "Replay diagnostics summary") -> None:
     print("=" * 100)
-    print("Replay gripper diagnostics summary")
+    print(title)
     print("=" * 100)
     print(f"rows: {len(rows)}")
 
@@ -785,9 +944,9 @@ def summarize_rows(rows: List[Dict[str, Any]]) -> None:
     print(f"gripper close/hold/open: {len(close_rows)} / {len(hold_rows)} / {len(open_rows)}")
 
     if close_rows:
-        print("close action steps:", [r["global_step"] for r in close_rows[:20]], "..." if len(close_rows) > 20 else "")
+        print("close action steps:", [(r["demo_global_index"], r["demo_step"]) for r in close_rows[:20]], "..." if len(close_rows) > 20 else "")
     if open_rows:
-        print("open action steps :", [r["global_step"] for r in open_rows[:20]], "..." if len(open_rows) > 20 else "")
+        print("open action steps :", [(r["demo_global_index"], r["demo_step"]) for r in open_rows[:20]], "..." if len(open_rows) > 20 else "")
 
     vals = []
     for r in rows:
@@ -801,32 +960,17 @@ def summarize_rows(rows: List[Dict[str, Any]]) -> None:
         print(f"open count   >= {HW_OPEN_MIN}: {int(np.sum(arr >= HW_OPEN_MIN))}")
         print(f"middle count           : {int(np.sum((arr > HW_CLOSE_MAX) & (arr < HW_OPEN_MIN)))}")
 
-    # 找 close 后 20 步
-    if close_rows:
-        first_close = close_rows[0]["global_step"]
-        win = [r for r in rows if first_close <= r["global_step"] <= first_close + 25]
-        print("\nfirst close 附近窗口：")
-        for r in win:
-            print(
-                f"  step={r['global_step']:04d}, a6={r['action_6_desc']}, "
-                f"fb {r['prev_gripper_feedback']} -> {r['next_gripper_feedback']} "
-                f"({r['next_gripper_state']}), "
-                f"hw_right {r['prev_hw_gripper_cmd_right']} -> {r['next_hw_gripper_cmd_right']}, "
-                f"reward={r['reward']}, done={r['done']}"
-            )
-
     rewards = [r for r in rows if r.get("reward", "") not in ("", None) and float(r["reward"]) != 0.0]
     dones = [r for r in rows if bool(r.get("done", False))]
     truncs = [r for r in rows if bool(r.get("truncated", False))]
 
     if rewards:
-        print(f"\nreward != 0 first step: {rewards[0]['global_step']}, reward={rewards[0]['reward']}")
+        print(f"\nfirst live reward != 0: demo={rewards[0]['demo_global_index']}, step={rewards[0]['demo_step']}, reward={rewards[0]['reward']}")
     if dones:
-        print(f"done=True first step: {dones[0]['global_step']}")
+        print(f"first live done=True  : demo={dones[0]['demo_global_index']}, step={dones[0]['demo_step']}")
     if truncs:
-        print(f"truncated=True first step: {truncs[0]['global_step']}")
+        print(f"first live truncated=True: demo={truncs[0]['demo_global_index']}, step={truncs[0]['demo_step']}")
 
-    # 手臂动作误差 summary
     live_pos_errs = []
     live_rot_errs = []
     live_norm_errs = []
@@ -841,7 +985,7 @@ def summarize_rows(rows: List[Dict[str, Any]]) -> None:
 
         vals_a = [abs(float(r[f"action_{j}"])) for j in range(6)]
         if max(vals_a) >= SATURATION_THRESHOLD:
-            saturated_rows.append(r["global_step"])
+            saturated_rows.append((r["demo_global_index"], r["demo_step"]))
 
     print("\n手臂动作误差 summary：")
     if live_pos_errs:
@@ -866,77 +1010,56 @@ def summarize_rows(rows: List[Dict[str, Any]]) -> None:
 
     print("\n判断建议：")
     print("  A. 如果 live_delta_action[:6] 普遍小于 action[:6]，说明机器人没完全跟上，优先增加 ACTION_SETTLE_SEC 或降低 HZ。")
-    print("  B. 如果 action 经常贴近 ±1，说明当前 POS_SCALE/ROT_SCALE 可能偏小；但改 scale 后要重新录 demo。")
+    print("  B. 如果 action 经常贴近 ±1，说明当前 POS_SCALE/ROT_SCALE 可能偏小。")
     print("  C. 如果 live error 很大但 action 不饱和，检查 reset 初始位姿、接触/碰撞、VR/外部 publisher、底层 IK 跟随。")
-    print("  D. 如果 live error 主要出现在接触后，可能是物体/夹爪/插入约束导致，不一定是 scale 问题。")
-    print("  1. 如果 action_6 没有 open(+1)，但 gripper feedback 回到 open，说明不是 demo 标签打开。")
-    print("  2. 如果 hold 阶段 next_hw_gripper_cmd_right 保持 10，但 feedback 升到 70/80，怀疑外部 publisher 或底层夹爪保持。")
-    print("  3. 如果 hold 阶段 next_hw_gripper_cmd_right 变成 80，说明 replay 链路中 hold memory 被改回 open。")
-    print("  4. 如果 reward/done 后仍有 rows，建议启用 STOP_ON_REWARD/STOP_ON_DONE，避免成功后继续移动。")
+    print("  D. 本脚本每条 demo 前都会 reset；如果某条 demo 失败，不会继续把下一条 demo 接在错误状态上。")
 
 
 # =============================================================================
-# 5. main
+# 5. replay one episode
 # =============================================================================
 
-def main():
-    print("=" * 100)
-    print("Demo Replay Full Motion + Gripper Diagnostics")
-    print("=" * 100)
-    print(f"DEMO_PATH                  : {DEMO_PATH}")
-    print(f"DEMO_FILE_INDEX            : {DEMO_FILE_INDEX}")
-    print(f"START_TRANSITION           : {START_TRANSITION}")
-    print(f"MAX_STEPS                  : {MAX_STEPS}")
-    print(f"DRY_RUN                    : {DRY_RUN}")
-    print(f"STEP_SLEEP_SEC             : {STEP_SLEEP_SEC}  # script-level extra sleep disabled")
-    print(f"REFRESH_OBS_AFTER_SLEEP    : {REFRESH_OBS_AFTER_SLEEP}  # script-level refresh disabled")
-    print("TIMING_MODE                : env.step() only; use config.ACTION_SETTLE_SEC in env")
-    print(f"FORCE_SCRIPT_MODE          : {FORCE_SCRIPT_MODE}")
-    print(f"USE_CLASSIFIER             : {USE_CLASSIFIER}")
-    print(f"STOP_ON_REWARD/DONE/TRUNC  : {STOP_ON_REWARD} / {STOP_ON_DONE} / {STOP_ON_TRUNCATED}")
-    print(f"CSV_PATH                   : {CSV_PATH}")
-
-    file_path, transitions, metadata, pkl_format = load_demo_payload(DEMO_PATH, DEMO_FILE_INDEX)
-    print("=" * 100)
-    print("Demo 文件")
-    print("=" * 100)
-    print(f"file: {file_path}")
-    print(f"format: {pkl_format}")
-    print(f"num transitions: {len(transitions)}")
-    if metadata:
-        print(f"metadata keys: {list(metadata.keys())}")
-
-    env = None
-    obs = None
-
+def reset_before_demo(env, demo_idx: int):
     if DRY_RUN:
-        current_pos, current_rot, current_hz = 0.018, 0.05, 15.0
-        obs = {}
-    else:
-        print("\n🌍 正在创建真实环境...")
-        env = make_env()
+        return {}
 
-        current_pos = get_config_value(env, "POS_SCALE", 0.018)
-        current_rot = get_config_value(env, "ROT_SCALE", 0.05)
-        current_hz = get_config_value(env, "HZ", 15.0)
+    print("\n" + "=" * 100)
+    print(f"🔄 准备播放 demo #{demo_idx}: 开始 reset")
+    print("=" * 100)
 
-        print("\n🔄 正在 reset 环境...")
-        obs, reset_info = env.reset()
+    obs, reset_info = env.reset()
 
-        force_script_mode_if_possible(env)
+    force_script_mode_if_possible(env)
 
-        print_state_keys(obs)
-        initial_pose = extract_ee_pose(obs)
-        print("=" * 100)
-        print("初始 EE pose 检查")
-        print("=" * 100)
-        print(f"initial EE pose: {None if initial_pose is None else np.asarray(initial_pose).tolist()}")
-        initial_feedback = extract_gripper_feedback(obs)
-        print("=" * 100)
-        print("初始 gripper feedback")
-        print("=" * 100)
-        print(f"initial gripper feedback: {initial_feedback} ({classify_gripper_feedback(initial_feedback)})")
-        print(f"initial _last_hw_gripper_cmd: {get_env_gripper_memory(env)}")
+    print_state_keys(obs)
+    initial_pose = extract_ee_pose(obs)
+    print("=" * 100)
+    print("reset 后初始 EE pose 检查")
+    print("=" * 100)
+    print(f"initial EE pose: {None if initial_pose is None else np.asarray(initial_pose).tolist()}")
+
+    initial_feedback = extract_gripper_feedback(obs)
+    print("=" * 100)
+    print("reset 后初始 gripper feedback")
+    print("=" * 100)
+    print(f"initial gripper feedback: {initial_feedback} ({classify_gripper_feedback(initial_feedback)})")
+    print(f"initial _last_hw_gripper_cmd: {get_env_gripper_memory(env)}")
+
+    return obs
+
+
+def replay_one_demo(
+    env,
+    obs,
+    episode: Dict[str, Any],
+    demo_global_index: int,
+    current_pos: float,
+    current_rot: float,
+    current_hz: float,
+) -> Tuple[List[Dict[str, Any]], str]:
+    transitions = episode["transitions"]
+    metadata = episode.get("metadata", {}) or {}
+    pkl_format = episode.get("pkl_format", "")
 
     demo_pos, demo_rot, demo_hz, scale_source = resolve_demo_scales(
         metadata,
@@ -944,30 +1067,33 @@ def main():
         current_rot,
         current_hz,
     )
+
     check_scale_consistency(demo_pos, demo_rot, current_pos, current_rot, scale_source, DRY_RUN)
 
-    end_transition = len(transitions)
-    if MAX_STEPS is not None:
-        end_transition = min(end_transition, START_TRANSITION + int(MAX_STEPS))
+    if MAX_STEPS_PER_DEMO is not None:
+        selected = transitions[:int(MAX_STEPS_PER_DEMO)]
+    else:
+        selected = transitions
 
-    selected = transitions[START_TRANSITION:end_transition]
     print("=" * 100)
-    print("Replay 范围")
+    print(f"▶️ 播放 demo #{demo_global_index}")
     print("=" * 100)
-    print(f"selected transitions: {len(selected)}")
-    print(f"global range: [{START_TRANSITION}, {end_transition})")
+    print(f"file              : {episode['file_path']}")
+    print(f"file index         : {episode['file_global_index']}")
+    print(f"local episode index: {episode['local_episode_index']}")
+    print(f"transition range   : [{episode['start_index']}, {episode['end_index_exclusive']})")
+    print(f"episode len        : {len(transitions)}")
+    print(f"selected len       : {len(selected)}")
+    print(f"pkl format         : {pkl_format}")
 
-    if WAIT_ENTER_BEFORE_REPLAY and not DRY_RUN:
-        input("确认机器人安全、夹爪附近无遮挡、VR 没有接管后，按 Enter 开始 replay 诊断...")
+    if WAIT_ENTER_BEFORE_EACH_DEMO and not DRY_RUN:
+        input(f"确认安全后按 Enter 开始播放 demo #{demo_global_index} ...")
 
-    rows: List[Dict[str, Any]] = []
-
-    close_seen = 0
-    open_seen = 0
+    rows = []
+    stop_reason = "episode_finished"
 
     for local_i, trans in enumerate(selected):
-        global_step = START_TRANSITION + local_i
-
+        demo_step = local_i
         raw_action = get_transition_action(trans)
         raw_min = float(np.min(raw_action)) if raw_action.size else 0.0
         raw_max = float(np.max(raw_action)) if raw_action.size else 0.0
@@ -976,14 +1102,10 @@ def main():
         action, changed_by_safety = prepare_action_for_step(raw_action, action_space)
 
         if action.size < 7:
-            raise ValueError(f"当前脚本期望 action 至少 7 维，但 step={global_step} action.shape={action.shape}")
+            raise ValueError(f"当前脚本期望 action 至少 7 维，但 demo={demo_global_index}, step={demo_step} action.shape={action.shape}")
 
         g = float(action[6])
         g_desc = describe_gripper_action(g)
-        if g <= -0.5:
-            close_seen += 1
-        if g >= 0.5:
-            open_seen += 1
 
         demo_obs, demo_next_obs = get_transition_obs_pair(trans)
 
@@ -1054,9 +1176,18 @@ def main():
         if prev_feedback is not None and next_feedback is not None:
             delta_feedback = float(next_feedback - prev_feedback)
 
+        demo_terminal = is_episode_terminal(trans)
+        demo_reward = transition_reward(trans)
+        demo_done = transition_done(trans)
+        demo_mask = transition_mask(trans)
+
         row = {
-            "global_step": global_step,
-            "local_step": local_i,
+            "demo_global_index": demo_global_index,
+            "demo_file_index": episode["file_global_index"],
+            "demo_local_episode_index": episode["local_episode_index"],
+            "demo_file": os.path.basename(episode["file_path"]),
+            "demo_step": demo_step,
+            "demo_transition_index": episode["start_index"] + local_i,
             "pkl_format": pkl_format,
             "demo_scale_source": scale_source,
             "demo_pos_scale": demo_pos,
@@ -1067,6 +1198,7 @@ def main():
             "raw_action_max": raw_max,
             "action_changed_by_safety": bool(changed_by_safety),
             "intervention_overrode_action": bool(intervention_overrode_action),
+
             "action_0": float(action[0]),
             "action_1": float(action[1]),
             "action_2": float(action[2]),
@@ -1108,12 +1240,19 @@ def main():
             "next_hw_gripper_cmd_right": "" if not next_mem or "right" not in next_mem else float(next_mem["right"]),
             "prev_hw_gripper_cmd_left": "" if not prev_mem or "left" not in prev_mem else float(prev_mem["left"]),
             "next_hw_gripper_cmd_left": "" if not next_mem or "left" not in next_mem else float(next_mem["left"]),
+
+            "demo_reward": float(demo_reward),
+            "demo_done": bool(demo_done),
+            "demo_mask": "" if demo_mask is None else float(demo_mask),
+            "demo_terminal": bool(demo_terminal),
+
             "refresh_success": bool(refresh_success),
             "refresh_source": refresh_source,
             "reward": "" if reward is None else float(reward),
             "done": bool(done),
             "truncated": bool(truncated),
         }
+
         for j in range(6):
             row[f"live_delta_action_{j}"] = "" if live_delta_action6 is None else float(live_delta_action6[j])
             row[f"live_action_err_{j}"] = "" if live_delta_action6 is None else float(live_delta_action6[j] - action[j])
@@ -1127,20 +1266,12 @@ def main():
             and (local_i % PRINT_EVERY == 0)
         )
 
-        # 夹爪事件附近强制打印
         if g_desc != "hold(0)":
             should_print = True
 
-        # close 后 25 步内强制打印，方便观察闭合是否回弹
-        if close_seen > 0 and close_seen <= 3:
-            if len(rows) >= 2:
-                first_close_step = next((r["global_step"] for r in rows if float(r["action_6"]) <= -0.5), None)
-                if first_close_step is not None and global_step <= first_close_step + 25:
-                    should_print = True
-
         if should_print:
             print("-" * 100)
-            print(f"step {global_step} / local {local_i}")
+            print(f"demo {demo_global_index} step {demo_step}/{len(selected)-1}")
             print(f"action[:6]                 : {np.round(action[:6], 4).tolist()}")
             print(f"action[6]                  : {g_desc} ({g})")
             print(f"expected pos delta (mm)    : {np.round(expected_pos_delta_m * 1000.0, 3).tolist()}")
@@ -1153,28 +1284,136 @@ def main():
             print(f"demo error                 : {format_error_metrics(demo_error_metrics)}")
             print(f"prev gripper feedback      : {prev_feedback} ({prev_state})")
             print(f"next gripper feedback      : {next_feedback} ({next_state})")
-            print(f"delta gripper feedback     : {delta_feedback}")
             print(f"env _last_hw_gripper_cmd   : before={prev_mem}, after={next_mem}")
+            print(f"demo reward/done/mask/term : {demo_reward} / {demo_done} / {demo_mask} / {demo_terminal}")
+            print(f"live reward/done/truncated : {reward} / {done} / {truncated}")
             print(f"intervention_overrode      : {intervention_overrode_action}")
-            print(f"obs_refresh_success        : {refresh_success}, source={refresh_source}")
-            print(f"reward={reward}, done={done}, truncated={truncated}")
-            print("说明：本版不在脚本外刷新 obs；obs 来自 env.step()。refresh_success=False 是正常的。")
 
         obs = next_obs
 
         if not DRY_RUN:
-            if STOP_ON_REWARD and reward is not None and float(reward) != 0.0:
-                print(f"✅ reward={reward} at step={global_step}，停止 replay，避免成功后继续移动。")
+            if STOP_ON_LIVE_REWARD and reward is not None and float(reward) != 0.0:
+                stop_reason = f"live_reward_{reward}"
+                print(f"✅ live reward={reward} at demo={demo_global_index}, step={demo_step}，停止当前 demo，准备 reset。")
                 break
-            if STOP_ON_DONE and bool(done):
-                print(f"✅ done=True at step={global_step}，停止 replay。")
+            if STOP_ON_LIVE_DONE and bool(done):
+                stop_reason = "live_done"
+                print(f"✅ live done=True at demo={demo_global_index}, step={demo_step}，停止当前 demo，准备 reset。")
                 break
-            if STOP_ON_TRUNCATED and bool(truncated):
-                print(f"✅ truncated=True at step={global_step}，停止 replay。")
+            if STOP_ON_LIVE_TRUNCATED and bool(truncated):
+                stop_reason = "live_truncated"
+                print(f"✅ live truncated=True at demo={demo_global_index}, step={demo_step}，停止当前 demo，准备 reset。")
                 break
 
-    summarize_rows(rows)
-    save_csv(rows)
+        if STOP_ON_DEMO_TERMINAL and demo_terminal:
+            stop_reason = "demo_terminal"
+            print(f"✅ demo terminal at demo={demo_global_index}, step={demo_step}，当前 demo 播放结束，准备 reset。")
+            break
+
+    print("=" * 100)
+    print(f"demo #{demo_global_index} 播放结束: stop_reason={stop_reason}, played_steps={len(rows)}")
+    print("=" * 100)
+
+    summarize_rows(rows, title=f"Demo #{demo_global_index} diagnostics summary")
+    return rows, stop_reason
+
+
+# =============================================================================
+# 6. main
+# =============================================================================
+
+def main():
+    print("=" * 100)
+    print("Episode-by-episode Demo Replay + Reset + Diagnostics")
+    print("=" * 100)
+    print(f"DEMO_PATH                    : {DEMO_PATH}")
+    print(f"FILE_INDEX                   : {FILE_INDEX}")
+    print(f"DEMO_INDEX_START             : {DEMO_INDEX_START}")
+    print(f"DEMO_INDEX_END               : {DEMO_INDEX_END}")
+    print(f"MAX_STEPS_PER_DEMO           : {MAX_STEPS_PER_DEMO}")
+    print(f"DRY_RUN                      : {DRY_RUN}")
+    print("TIMING_MODE                  : env.step() only; use config.ACTION_SETTLE_SEC in env")
+    print(f"WAIT_ENTER_BEFORE_EACH_DEMO  : {WAIT_ENTER_BEFORE_EACH_DEMO}")
+    print(f"FORCE_SCRIPT_MODE            : {FORCE_SCRIPT_MODE}")
+    print(f"USE_CLASSIFIER               : {USE_CLASSIFIER}")
+    print(f"STOP_ON_LIVE_REWARD/DONE/TRUNC: {STOP_ON_LIVE_REWARD} / {STOP_ON_LIVE_DONE} / {STOP_ON_LIVE_TRUNCATED}")
+    print(f"STOP_ON_DEMO_TERMINAL        : {STOP_ON_DEMO_TERMINAL}")
+    print(f"CSV_PATH                     : {CSV_PATH}")
+
+    episodes, tails, inventory = load_all_demo_episodes(DEMO_PATH, FILE_INDEX)
+    print_episode_inventory(episodes, tails, inventory)
+
+    if not episodes:
+        raise RuntimeError("没有识别到完整 demo。请检查 pkl 里是否有 dones=True / masks=0 / reward>0。")
+
+    start = int(DEMO_INDEX_START)
+    end = len(episodes) if DEMO_INDEX_END is None else min(int(DEMO_INDEX_END), len(episodes))
+    if start < 0 or start >= len(episodes):
+        raise IndexError(f"DEMO_INDEX_START={start} 越界，总 demos={len(episodes)}")
+    if end <= start:
+        raise ValueError(f"DEMO_INDEX_END={end} 必须大于 DEMO_INDEX_START={start}")
+
+    selected_episodes = episodes[start:end]
+    print("=" * 100)
+    print("Replay demo 范围")
+    print("=" * 100)
+    print(f"selected demos: {len(selected_episodes)}")
+    print(f"global demo index range: [{start}, {end})")
+
+    env = None
+    current_pos, current_rot, current_hz = 0.018, 0.05, 15.0
+
+    if not DRY_RUN:
+        print("\n🌍 正在创建真实环境...")
+        env = make_env()
+        current_pos = get_config_value(env, "POS_SCALE", 0.018)
+        current_rot = get_config_value(env, "ROT_SCALE", 0.05)
+        current_hz = get_config_value(env, "HZ", 15.0)
+        print(f"current POS_SCALE={current_pos}, ROT_SCALE={current_rot}, HZ={current_hz}")
+
+    all_rows = []
+    stop_reasons = []
+
+    for ep_offset, episode in enumerate(selected_episodes):
+        demo_global_index = start + ep_offset
+
+        obs = reset_before_demo(env, demo_global_index)
+
+        rows, reason = replay_one_demo(
+            env=env,
+            obs=obs,
+            episode=episode,
+            demo_global_index=demo_global_index,
+            current_pos=current_pos,
+            current_rot=current_rot,
+            current_hz=current_hz,
+        )
+
+        all_rows.extend(rows)
+        stop_reasons.append({
+            "demo_global_index": demo_global_index,
+            "stop_reason": reason,
+            "played_steps": len(rows),
+        })
+
+        if WAIT_ENTER_BEFORE_RESET_AFTER_DEMO and not DRY_RUN and ep_offset < len(selected_episodes) - 1:
+            input(f"demo #{demo_global_index} 已结束。按 Enter reset 并播放下一条 demo...")
+
+        # 注意：下一轮循环开头会 reset。
+        if ep_offset < len(selected_episodes) - 1:
+            print("\n" + "#" * 100)
+            print(f"✅ demo #{demo_global_index} 完成。下一步将 reset，然后播放 demo #{demo_global_index + 1}")
+            print("#" * 100)
+
+    print("=" * 100)
+    print("全部 selected demos 播放完成")
+    print("=" * 100)
+    print("stop reasons:")
+    for item in stop_reasons:
+        print(f"  demo#{item['demo_global_index']}: {item['stop_reason']}, played_steps={item['played_steps']}")
+
+    summarize_rows(all_rows, title="All selected demos diagnostics summary")
+    save_csv(all_rows)
 
     print("=" * 100)
     print("完成")
@@ -1183,4 +1422,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
