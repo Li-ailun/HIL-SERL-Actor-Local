@@ -153,7 +153,7 @@ class GalaxeaUSBEnvConfig:
     #
     HZ = 15
     DISPLAY_IMAGES = True
-    MAX_EPISODE_LENGTH = 400
+    MAX_EPISODE_LENGTH = 500
 
     # ==============================
     # 2.1 step 等待 / 状态同步
@@ -165,7 +165,11 @@ class GalaxeaUSBEnvConfig:
     # 0.00：最接近原始 actor 频率，可能抖
     # 0.05：建议先试，轻量防抖
     # 0.08~0.10：更稳，但 actor 采样会更慢
-    ACTION_SETTLE_SEC = 0.2
+    #HZ = 15，ACTION_SETTLE_SEC = 0.2后，actor频率3.6hz左右
+    #HZ = 15，ACTION_SETTLE_SEC = 0.00后，actor频率10-12hz
+    # actor: ... [00:xx<...,  X.XXit/s]
+    #     这里的 X.XXit/s 基本就是 actor 实际输出频率。之前你日志里：
+    ACTION_SETTLE_SEC = 0.00
 
     # 调试用。True 时 env.step 会打印每步耗时和实际频率。
     DEBUG_STEP_TIMING = False #True#Fals
@@ -215,7 +219,7 @@ class GalaxeaUSBEnvConfig:
     }
 
     HEAD_CAMERA = {
-        "device_index": 2,   # 用 v4l2-ctl --list-devices 查询
+        "device_index": 6,   # 用 v4l2-ctl --list-devices 查询
         "api": cv2.CAP_V4L2,
         "fourcc": "MJPG",
         "frame_width": 1344,

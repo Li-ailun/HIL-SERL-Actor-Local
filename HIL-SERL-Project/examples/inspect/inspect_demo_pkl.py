@@ -1,5 +1,5 @@
 
-
+#打印夹爪状态
 
 """
 inspect_demo_pkl_all.py
